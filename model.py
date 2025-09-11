@@ -1,13 +1,18 @@
-import torch
+import torch, math
 
 from pydantic import BaseModel
-from torch import Tensor
+from torch import nn, Tensor
+from torch.nn import functional as F
 
 class ModelConfig(BaseModel):
     base: int = 10000
+    vocab_size: int = 50304
     ctx_size: int = 256
     embed_dim: int = 512
     n_heads: int = 8
+    ffn_dim: int = 512 * 4
+    eps: float = 1e-8
+    n_blocks: int = 8
 
 def get_freqs_cis(cfg: ModelConfig) -> Tensor:
     head_dim = cfg.embed_dim // cfg.n_heads
@@ -27,7 +32,107 @@ def apply_rot_emb(x: Tensor, freq_cis: Tensor) -> Tensor:
     _x = x.clone()
     _x = _x.view(bsz, n_heads, seq_len, head_dim // 2, 2)
     _x = torch.view_as_complex(_x) # bsz, n_heads, seq_len, head_dim / 2
-    _x_rot = _x * freq_cis.unsqueeze(0).unsqueeze(0)[:, :, :seq_len, :] # bsz, n_heads, seq_len, head_dim / 2
+    _x_rot = _x * freq_cis[:, :, :seq_len, :] # bsz, n_heads, seq_len, head_dim / 2
     _x_rot = torch.view_as_real(_x_rot) # bsz, n_heads, seq_len, head_dim / 2, 2
     _x_rot = _x_rot.view(bsz, n_heads, seq_len, head_dim)
     return _x_rot
+
+
+class RMSNorm(nn.Module):
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+
+        self.W = nn.Parameter(torch.ones(cfg.embed_dim))
+        self.eps = cfg.eps
+    
+    def forward(self, x: Tensor) -> Tensor:
+        rms = x.pow(2).mean(-1, keepdim = True).add(self.eps).rsqrt()
+        return self.W * x * rms
+
+
+class MHA(nn.Module):
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        
+        super().__init__()
+        self.cfg = cfg
+        self.QKV = nn.Linear(cfg.embed_dim, cfg.embed_dim * 3, bias = False)
+        self.O = nn.Linear(cfg.embed_dim, cfg.embed_dim, bias = False)
+        
+        # get freqs_cis and register it
+        freqs_cis = get_freqs_cis(cfg).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('freqs_cis', freqs_cis)
+        
+        # construct mask and register it
+        mask = float("-inf") * torch.triu(torch.ones(1, 1, cfg.ctx_size, cfg.ctx_size), diagonal=1)
+        self.register_buffer("mask", mask)
+
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seq_len, embed_dim = x.shape
+        n_heads, head_dim = self.cfg.n_heads, embed_dim // self.cfg.n_heads
+        qkv = self.QKV(x) #
+        q, k, v = qkv.split(embed_dim, -1)
+        q: Tensor = q.view(bsz, seq_len, n_heads, head_dim).transpose(1, 2) # bsz, n_heads, seq_len, head_dim
+        k: Tensor = k.view(bsz, seq_len, n_heads, head_dim).transpose(1, 2)
+        v: Tensor = v.view(bsz, seq_len, n_heads, head_dim).transpose(1, 2)
+
+        q, k = apply_rot_emb(q, self.freqs_cis), apply_rot_emb(k, self.freqs_cis)
+
+        wts = (q @ k.T) / math.sqrt(head_dim)
+        wts = wts + self.mask[:, :, :seq_len, :seq_len]
+        wts = F.softmax(wts, dim = -1)
+
+        y = wts @ v # bsz, n_heads, seq_len, head_dim
+        y = y.transpose(1, 2).contiguous().view(bsz, seq_len, embed_dim)
+        return self.O(y)
+
+
+class FFN(nn.Module):
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(cfg.embed_dim, cfg.ffn_dim, bias = False),
+            nn.ReLU(),
+            nn.Linear(cfg.ffn_dim, cfg.embed_dim, bias = False)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+class Block(nn.Module):
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.mha = MHA(cfg)
+        self.ffn = FFN(cfg)
+
+        self.norm1 = RMSNorm(cfg)
+        self.norm2 = RMSNorm(cfg)
+
+    def forward(self, x: Tensor) -> Tensor:
+
+        x = x + self.mha(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.embed_dim)
+        self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_blocks))
+        self.norm = RMSNorm(cfg)
+        self.lm_head = nn.Linear(cfg.embed_dim, cfg.vocab_size)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.tok_emb(x)
+        for block in self.blocks:
+            x = block(x)
+
+        return self.lm_head(self.norm(x))
