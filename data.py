@@ -1,53 +1,24 @@
-from datasets import load_dataset
-import tiktoken, pathlib, json, numpy as np, tqdm
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+from models import TrainingConfig
+import numpy as np, torch
 
-tokenizer = tiktoken.get_encoding("gpt2")
-with open("config.json", "r") as f:
-    config = json.loads(f.read())
+class ShardedDataset(Dataset):
 
-NUM_TOKENS_PER_SHARD = 25_000_000
-CTX_LENGTH = config["context_length"]
-NUM_SEQUENCES_PER_SHARD = NUM_TOKENS_PER_SHARD // CTX_LENGTH
+    def __init__(self, config: TrainingConfig, shards_dir: Path) -> None:
+        self.config = config
+        self.shards_dir = shards_dir
+        self.shard_paths = list(shards_dir.glob("shard_*.bin"))
 
-for split in {"train", "test"}:
-    ds = load_dataset("wikitext", "wikitext-103-v1", split=split)
-    stories = []
-    story_content = ""
-    for row in ds["text"]:
-        if row.count("=") == 2:
-            if len(story_content.strip()) > 0:
-                stories.append(story_content)
-                story_content = ""
-        story_content += row
-
-    if len(story_content.strip()) > 0:
-        stories.append(story_content)
-
-    shard_id = 0
-    buf = []
-
-    out_dir = pathlib.Path(f"shards/{split}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    for story in tqdm.tqdm(stories, desc="Creating shards..."):
-
-        ids = tokenizer.encode(story) + [tokenizer.eot_token]
-        buf.extend(ids)
-
-        if len(buf) >= NUM_TOKENS_PER_SHARD:
-            shard_path = open(out_dir / f"shard_{shard_id:05d}.bin", "wb")
-            block = np.asarray(buf[:NUM_SEQUENCES_PER_SHARD * CTX_LENGTH], dtype=np.uint16)
-            block.tofile(shard_path)
-            shard_path.close()
-
-            del buf[:NUM_SEQUENCES_PER_SHARD * CTX_LENGTH]
-            shard_id += 1
-
-    if len(buf) > 0:
-        shard_path = open(out_dir / f"shard_{shard_id:05d}.bin", "wb")
-        block = np.asarray(buf[:NUM_SEQUENCES_PER_SHARD * CTX_LENGTH], dtype=np.uint16)
-        block.tofile(shard_path)
-        shard_path.close()
-        
-
-    print(f"Finished writing to {shard_id+1} shards")
+        self.memmaps = [np.memmap(shard_path, dtype=np.uint8) for i, shard_path in enumerate(self.shard_paths)]
+        self.cum_seqs = np.cumsum([len(self.memmaps[i]) // self.config.ctx_size for i in range(len(self.memmaps))])
+    
+    def __len__(self):
+        return self.cum_seqs[-1]
+    
+    def __getitem__(self, index: int):
+        index = index % self.cum_seqs[-1]
+        for i in range(len(self.cum_seqs)):
+            if index < self.cum_seqs[i]:
+                index -= self.cum_seqs[i - 1]
+                return torch.from_numpy(self.memmaps[i][index * self.config.ctx_size: (index + 1) * self.config.ctx_size])

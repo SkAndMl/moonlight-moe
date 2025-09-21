@@ -1,21 +1,8 @@
 import torch, math
 
-from pydantic import BaseModel
+from models import ModelConfig
 from torch import nn, Tensor
 from torch.nn import functional as F
-
-class ModelConfig(BaseModel):
-    base: int = 10000
-    vocab_size: int = 50304
-    ctx_size: int = 256
-    embed_dim: int = 512
-    n_heads: int = 8
-    ffn_dim: int = 512 * 4
-    eps: float = 1e-8
-    n_blocks: int = 8
-    n_experts: int = 8
-    capacity_factor: float = 1.0
-    alpha_aux_loss: float = 1e-2
 
 def get_freqs_cis(cfg: ModelConfig) -> Tensor:
     head_dim = cfg.embed_dim // cfg.n_heads
