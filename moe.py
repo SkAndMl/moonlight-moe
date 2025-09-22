@@ -55,7 +55,7 @@ class MHA(nn.Module):
         self.register_buffer('freqs_cis', freqs_cis)
         
         # construct mask and register it
-        mask = float("-inf") * torch.triu(torch.ones(1, 1, cfg.ctx_size, cfg.ctx_size), diagonal=1)
+        mask = torch.triu(torch.ones(1, 1, cfg.ctx_size, cfg.ctx_size) * float("-inf"), diagonal=1)
         self.register_buffer("mask", mask)
 
 
@@ -141,7 +141,9 @@ class MoE(nn.Module):
         for e in range(self.n_experts):
             mask = per_token_expert_idxs == e
             idxs_e = torch.nonzero(mask, as_tuple=False).squeeze(1)[:cap]
-            y_out[idxs_e, :] = per_token_expert_prob[idxs_e] * self.experts[e](x_flat[idxs_e, :])
+            if idxs_e.shape[0] == 0:
+                continue
+            y_out[idxs_e, :] = per_token_expert_prob[idxs_e].unsqueeze(-1) * self.experts[e](x_flat[idxs_e, :])
         
         return y_out.view(bsz, seq_len, embed_dim)
 
@@ -162,7 +164,7 @@ class Block(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
-class GPT(nn.Module):
+class GPTMoE(nn.Module):
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -171,6 +173,16 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_blocks))
         self.norm = RMSNorm(cfg)
         self.lm_head = nn.Linear(cfg.embed_dim, cfg.vocab_size)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.tok_emb(x)
@@ -184,4 +196,13 @@ class GPT(nn.Module):
         for block in self.blocks:
             if hasattr(block.ffn, 'aux_loss'):
                 _loss += block.ffn.aux_loss
-        return _loss    
+        return _loss
+    
+    def generate(self, x: Tensor, max_tokens: int=20) -> list[int]:
+        x = x.view(1, x.shape[0])
+        for _ in range(max_tokens):
+            logits = self(x)
+            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            x = torch.cat([x, next_token], dim=1)
+        
+        return x[0].tolist()
