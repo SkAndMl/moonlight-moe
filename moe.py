@@ -70,11 +70,13 @@ class MHA(nn.Module):
 
         q, k = apply_rot_emb(q, self.freqs_cis), apply_rot_emb(k, self.freqs_cis)
 
-        wts = (q @ k.transpose(-2, -1)) / math.sqrt(head_dim)
-        wts = wts + self.mask[:, :, :seq_len, :seq_len]
-        wts = F.softmax(wts, dim = -1)
+        # wts = (q @ k.transpose(-2, -1)) / math.sqrt(head_dim)
+        # wts = wts + self.mask[:, :, :seq_len, :seq_len]
+        # wts = F.softmax(wts, dim = -1)
+        # y = wts @ v # bsz, n_heads, seq_len, head_dim 
+        # use flash attention instead
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-        y = wts @ v # bsz, n_heads, seq_len, head_dim
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, embed_dim)
         return self.O(y)
 
@@ -173,6 +175,8 @@ class GPTMoE(nn.Module):
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_blocks))
         self.norm = RMSNorm(cfg)
         self.lm_head = nn.Linear(cfg.embed_dim, cfg.vocab_size)
+        # add weight tying
+        self.lm_head.weight = self.tok_emb.weight
 
         self.apply(self._init_weights)
 
@@ -205,4 +209,4 @@ class GPTMoE(nn.Module):
             next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
             x = torch.cat([x, next_token], dim=1)
         
-        return x[0].tolist()
+        return x[0].tolist() 

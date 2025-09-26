@@ -13,8 +13,11 @@ class ModelConfig(BaseModel):
     capacity_factor: float = 1.0
     alpha_aux_loss: float = 1e-2
 
-
 class TrainingConfig(BaseModel):
     ctx_size: int = 256
     batch_size: int = 16
-    lr: float = 1e-3
+    min_lr: float = 6e-5
+    max_lr: float = 6e-4
+    weight_decay: float = 1e-2
+    accumulation_steps: int = 8
+    device: str = "cpu"
