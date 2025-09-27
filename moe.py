@@ -4,6 +4,16 @@ from models import ModelConfig
 from torch import nn, Tensor
 from torch.nn import functional as F
 
+def fan_in(module: nn.Module) -> int | None:
+    w = getattr(module, "weight", None)
+    if w is None or w.data is None:
+        raise ValueError(f"{module.__class__.__name__} has not weight")
+    shape = w.shape
+    if w.ndim < 2:
+        return 0.02
+    assert w.ndim == 2 # since we have only linear layers
+    return shape[1]
+
 def get_freqs_cis(cfg: ModelConfig) -> Tensor:
     head_dim = cfg.embed_dim // cfg.n_heads
     
@@ -184,11 +194,10 @@ class GPTMoE(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
+            std = math.sqrt(0.1 / fan_in(module))
+            torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-2*std, b=2*std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.tok_emb(x)

@@ -8,8 +8,7 @@ from typing import Literal, Any
 from datetime import datetime
 from log import logger
 
-import torch, tiktoken, time, math
-
+import torch, tiktoken, time, math, wandb
 
 def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfig):
     train_ds = ShardedDataset(config=training_cfg, shards_dir=train_dir)
@@ -34,6 +33,16 @@ train_dl, test_dl = get_dataloaders(Path("shards/train"), Path("shards/test"), t
 
 total_steps = len(train_dl) // training_cfg.accumulation_steps
 warmup_steps = int(0.02 * total_steps)
+
+wandb.init(
+    project=f"gpt-moe-training-{datetime.now().strftime('%d_%m_%Y')}",
+    config={
+        "model_cfg": model_cfg.model_dump(),
+        "training_cfg": training_cfg.model_dump(),
+        "total_steps": total_steps,
+        "warmup_steps": warmup_steps
+    }
+)
 
 def get_lr(it: int):
 
@@ -98,6 +107,15 @@ for step in range(total_steps):
     throughput = (bsz * seq_len * training_cfg.accumulation_steps) / (time.time() - t0)
     logger.info(f"step: {step + 1:>5} | loss: {loss_accum.item():.4f} | moe_aux_loss: {moe_aux_loss_accum.item():.4f} | lr: {lr:.6f} | tokens per sec: {throughput:.4f} | norm: {norm.item():.4f}")
     
+    wandb.log({
+        "train/loss": loss_accum.item(),
+        "train/moe_aux_loss": moe_aux_loss_accum.item(),
+        "train/lr": lr,
+        "train/throughput": throughput,
+        "train/grad_norm": norm.item(),
+        "step": step + 1
+    })
+
     if (step + 1) % 100 == 0:
         if counted == 0:
             logger.info(f"step: {step + 1:>5} | no router stats")
@@ -110,8 +128,22 @@ for step in range(total_steps):
             p_entropy = float(-(p_avg * (p_avg.clamp(1e-12)).log()).sum().item())
             logger.info(f"step: {step + 1:>5} | drop_rate: {drop_avg:.4f} | f_top: {f_top:.4f} | f_min: {f_min:.4f} | p_entropy: {p_entropy:.4f}")
 
+            wandb.log({
+                "moe/drop_rate": drop_avg,
+                "moe/f_top": f_top,
+                "moe/f_min": f_min,
+                "moe/p_entropy": p_entropy,
+                "moe/expert_frequencies": wandb.Histogram(f_avg.numpy()),
+                "moe/expert_probabilities": wandb.Histogram(p_avg.numpy()),
+                "step": step + 1
+            })
 
     if (step + 1) % 1000 == 0:
         start = "There was a"
         gen = model.generate(torch.tensor(tokenizer.encode(start), device=device))
-        logger.info(f"step: {step + 1:>5} | generation: {tokenizer.decode(gen)}")
+        gen_text = tokenizer.decode(gen)
+        logger.info(f"step: {step + 1:>5} | generation: {gen_text}")
+        wandb.log({
+            "generation": wandb.Html(f"<p><b>Prompt:</d> {start}<br><b>Generated:</b> {gen_text}</p>"),
+            "step": step + 1
+        })
