@@ -4,9 +4,12 @@ from models import TrainingConfig, ModelConfig
 from moe import GPTMoE
 from pathlib import Path
 from torch.optim import AdamW
-from typing import Literal
+from typing import Literal, Any
+from datetime import datetime
+from log import logger
 
 import torch, tiktoken, time, math
+
 
 def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfig):
     train_ds = ShardedDataset(config=training_cfg, shards_dir=train_dir)
@@ -24,7 +27,7 @@ def get_device() -> Literal["cuda", "mps", "cpu"]:
     return "cpu"
 
 device = get_device()
-print(f"training on {device}...")
+logger.info(f"training on {device}...")
 tokenizer = tiktoken.get_encoding("gpt2")
 training_cfg, model_cfg = TrainingConfig(device=device), ModelConfig()
 train_dl, test_dl = get_dataloaders(Path("shards/train"), Path("shards/test"), training_cfg)
@@ -47,7 +50,7 @@ def get_lr(it: int):
 
 model = GPTMoE(model_cfg).to(device)
 model = torch.compile(model)
-print(f"compiled model...")
+logger.info(f"compiled model...")
 
 param_groups = {
     "decay_params": [p for name, p in model.named_parameters() if 'bias' not in name],
@@ -66,6 +69,8 @@ for step in range(total_steps):
     t0 = time.time()
     optimizer.zero_grad()
     loss_accum, moe_aux_loss_accum = 0.0, 0.0
+    f_accum, p_accum, drop_accum = torch.zeros(model_cfg.n_experts, device="cpu"), torch.zeros(model_cfg.n_experts, device="cpu"), 0.0
+    counted = 0
     for _ in range(training_cfg.accumulation_steps):
         x, y = next(train_dl)
         x, y = x.to(device), y.to(device)
@@ -77,6 +82,13 @@ for step in range(total_steps):
         loss_accum += loss.detach()
         moe_aux_loss_accum += model.moe_aux_loss().detach() / training_cfg.accumulation_steps
     
+        stats = model.router_stats()
+        if stats is not None:
+            f_accum += stats["f_e"]
+            p_accum += stats["p_e"]
+            drop_accum += stats["drop_rate"]
+            counted += 1
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -84,12 +96,22 @@ for step in range(total_steps):
     optimizer.step()
 
     throughput = (bsz * seq_len * training_cfg.accumulation_steps) / (time.time() - t0)
-    print(f"step: {step + 1:>5} | loss: {loss_accum.item():.4f} | moe_aux_loss: {moe_aux_loss_accum.item():.4f} | lr: {lr:.6f} | tokens per sec: {throughput:.4f} | norm: {norm.item():.4f}")
+    logger.info(f"step: {step + 1:>5} | loss: {loss_accum.item():.4f} | moe_aux_loss: {moe_aux_loss_accum.item():.4f} | lr: {lr:.6f} | tokens per sec: {throughput:.4f} | norm: {norm.item():.4f}")
     
     if (step + 1) % 100 == 0:
+        if counted == 0:
+            logger.info(f"step: {step + 1:>5} | no router stats")
+        else:
+            f_avg = (f_accum / counted)
+            p_avg = (p_accum / counted)
+            drop_avg = drop_accum / counted
+            f_top = float(f_avg.max().item())
+            f_min = float(f_avg.min().item())
+            p_entropy = float(-(p_avg * (p_avg.clamp(1e-12)).log()).sum().item())
+            logger.info(f"step: {step + 1:>5} | drop_rate: {drop_avg:.4f} | f_top: {f_top:.4f} | f_min: {f_min:.4f} | p_entropy: {p_entropy:.4f}")
+
+
+    if (step + 1) % 1000 == 0:
         start = "There was a"
         gen = model.generate(torch.tensor(tokenizer.encode(start), device=device))
-        print(f"step: {step + 1} | generation: {tokenizer.decode(gen)}")
-    
-    if step == 500:
-        break
+        logger.info(f"step: {step + 1:>5} | generation: {tokenizer.decode(gen)}")

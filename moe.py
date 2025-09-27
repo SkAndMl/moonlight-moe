@@ -124,14 +124,14 @@ class MoE(nn.Module):
         expert_probs: Tensor = self.router(x_flat) # t, e
 
         # calculate aux loss
-        per_token_expert_idxs = torch.argmax(expert_probs, dim=-1) # t
-        per_token_expert_prob = expert_probs.gather(1, per_token_expert_idxs.unsqueeze(-1)).squeeze(1) # t
-        # fraction of tokens routed to an expert
-        f_e = per_token_expert_idxs.bincount(minlength=self.n_experts) / t # e
-        # total probability of tokens routed to an expert
-        p_e = expert_probs.mean(dim=0) # e
+        per_token_expert_prob, per_token_expert_idxs = expert_probs.max(dim=-1) # t, t 
+        ## fraction of tokens routed to an expert
+        # self here because we need to track these stats later
+        self.f_e = per_token_expert_idxs.bincount(minlength=self.n_experts) / t # e
+        ## total probability of tokens routed to an expert
+        self.p_e = expert_probs.mean(dim=0) # e
         self.aux_loss = (
-            self.cfg.alpha_aux_loss * self.n_experts * (f_e * p_e).sum()
+            self.cfg.alpha_aux_loss * self.n_experts * (self.f_e * self.p_e).sum()
         ).to(x.device)
 
         # calculate max. num of tokens to be routed to an expert
@@ -140,13 +140,15 @@ class MoE(nn.Module):
             1
         )
         y_out = torch.zeros_like(x_flat)
+        self.drop_rate = 0
         for e in range(self.n_experts):
             mask = per_token_expert_idxs == e
             idxs_e = torch.nonzero(mask, as_tuple=False).squeeze(1)[:cap]
             if idxs_e.shape[0] == 0:
                 continue
             y_out[idxs_e, :] = per_token_expert_prob[idxs_e].unsqueeze(-1) * self.experts[e](x_flat[idxs_e, :])
-        
+            self.drop_rate += max(mask.sum().item() - cap, 0) / t
+
         return y_out.view(bsz, seq_len, embed_dim)
 
 
@@ -170,7 +172,7 @@ class GPTMoE(nn.Module):
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-
+        self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.embed_dim)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_blocks))
         self.norm = RMSNorm(cfg)
@@ -201,6 +203,37 @@ class GPTMoE(nn.Module):
             if hasattr(block.ffn, 'aux_loss'):
                 _loss += block.ffn.aux_loss
         return _loss
+
+    def router_stats(self):
+        device = self.lm_head.weight.device
+        n_e = self.cfg.n_experts
+        n_b = len(self.blocks)
+
+        f_sum = torch.zeros(n_e, device=device)
+        p_sum = torch.zeros(n_e, device=device)
+        drop_sum = torch.tensor(0.0, device=device)
+
+        counted = 0
+        for block in self.blocks:
+            moe = block.ffn
+            if hasattr(moe, 'f_e') and hasattr(moe, "p_e") and hasattr(moe, "drop_rate"):
+                f_sum += moe.f_e
+                p_sum += moe.p_e
+                drop_sum += torch.as_tensor(moe.drop_rate, device=device, dtype=torch.float32)
+                counted += 1
+        
+        if counted == 0:
+            return None
+        
+        f_avg = (f_sum / counted).detach().cpu()
+        p_avg = (p_sum / counted).detach().cpu()
+        drop_avg = float((drop_sum / counted).item())
+
+        return {
+            "f_e": f_avg,
+            "p_e": p_avg,
+            "drop_rate": drop_avg
+        }
     
     def generate(self, x: Tensor, max_tokens: int=20) -> list[int]:
         x = x.view(1, x.shape[0])
