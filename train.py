@@ -4,7 +4,7 @@ from models import TrainingConfig, ModelConfig
 from moe import GPTMoE
 from pathlib import Path
 from torch.optim import AdamW
-from typing import Literal, Any
+from typing import Literal
 from datetime import datetime
 from log import logger
 
@@ -55,6 +55,17 @@ def get_lr(it: int):
         return min_lr + (1/2) * (max_lr - min_lr) * (1 + math.cos(math.pi * step_ratio))
     else:
         return min_lr
+
+def evaluate() -> torch.Tensor:
+    loss_accum = 0
+    for x, y in test_dl:
+        x, y = x.to(device), y.to(device)
+        bsz, seq_len = x.shape
+        logits: torch.Tensor = model(x)
+        loss = torch.nn.functional.cross_entropy(logits.view(bsz*seq_len, -1), y.view(-1,))
+        loss_accum += loss.detach() + model.moe_aux_loss()
+    
+    return loss_accum / len(test_dl)
 
 
 model = GPTMoE(model_cfg).to(device)
@@ -137,6 +148,13 @@ for step in range(total_steps):
                 "moe/expert_probabilities": wandb.Histogram(p_avg.numpy()),
                 "step": step + 1
             })
+
+    if (step + 1) % 200 == 0:
+        test_loss = evaluate()
+        logger.info(f"step: {step + 1:>5} | val_loss: {test_loss:.4f}")
+        wandb.log({
+            "test/loss": test_loss.item()
+        })
 
     if (step + 1) % 1000 == 0:
         start = "There was a"
