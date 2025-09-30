@@ -10,7 +10,7 @@ class ShardedDataset(Dataset):
         self.shards_dir = shards_dir
         self.shard_paths = list(shards_dir.glob("shard_*.bin"))
 
-        self.memmaps = [np.memmap(shard_path, dtype=np.uint8) for i, shard_path in enumerate(self.shard_paths)]
+        self.memmaps = [np.memmap(shard_path, dtype=np.uint16) for i, shard_path in enumerate(self.shard_paths)]
         self.cum_seqs = np.cumsum([len(self.memmaps[i]) // (self.config.ctx_size + 1) for i in range(len(self.memmaps))])
     
     def __len__(self):

@@ -56,6 +56,7 @@ def get_lr(it: int):
     else:
         return min_lr
 
+@torch.inference_mode()
 def evaluate() -> torch.Tensor:
     loss_accum = 0
     for x, y in test_dl:
@@ -156,7 +157,7 @@ for step in range(total_steps):
             "test/loss": test_loss.item()
         })
 
-    if (step + 1) % 1000 == 0:
+    if (step + 1) % 200 == 0:
         start = "There was a"
         gen = model.generate(torch.tensor(tokenizer.encode(start), device=device))
         gen_text = tokenizer.decode(gen)
