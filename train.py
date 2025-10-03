@@ -29,7 +29,7 @@ device = get_device()
 logger.info(f"training on {device}...")
 tokenizer = tiktoken.get_encoding("gpt2")
 training_cfg, model_cfg = TrainingConfig(device=device), ModelConfig()
-train_dl, test_dl = get_dataloaders(Path("shards/train"), Path("shards/test"), training_cfg)
+train_dl, test_dl = get_dataloaders(Path("shards/train"), Path("shards/validation"), training_cfg)
 
 total_steps = len(train_dl) // training_cfg.accumulation_steps
 warmup_steps = int(0.02 * total_steps)
@@ -70,6 +70,7 @@ def evaluate() -> torch.Tensor:
 
 
 model = GPTMoE(model_cfg).to(device)
+print(f"Total params: {sum(p.numel() for p in model.parameters())}")
 model = torch.compile(model)
 logger.info(f"compiled model...")
 

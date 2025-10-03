@@ -9,29 +9,17 @@ NUM_TOKENS_PER_SHARD = 25_000_000
 CTX_LENGTH = config["context_length"]
 NUM_SEQUENCES_PER_SHARD = NUM_TOKENS_PER_SHARD // CTX_LENGTH
 
-for split in {"train", "test"}:
-    ds = load_dataset("wikitext", "wikitext-103-v1", split=split)
-    stories = []
-    story_content = ""
-    for row in ds["text"]:
-        if row.count("=") == 2:
-            if len(story_content.strip()) > 0:
-                stories.append(story_content)
-                story_content = ""
-        story_content += row
-
-    if len(story_content.strip()) > 0:
-        stories.append(story_content)
-
+for split in {"train", "validation"}:
+    ds = load_dataset("roneneldan/TinyStories", split=split)
     shard_id = 0
     buf = []
 
     out_dir = pathlib.Path(f"shards/{split}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for story in tqdm.tqdm(stories, desc="Creating shards..."):
+    for row in tqdm.tqdm(ds, desc="Creating shards..."):
 
-        ids = tokenizer.encode(story) + [tokenizer.eot_token]
+        ids = tokenizer.encode(row["text"]) + [tokenizer.eot_token]
         buf.extend(ids)
 
         if len(buf) >= NUM_TOKENS_PER_SHARD:

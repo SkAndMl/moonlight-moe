@@ -4,12 +4,13 @@ class ModelConfig(BaseModel):
     base: int = 10000
     vocab_size: int = 50304
     ctx_size: int = 512
-    embed_dim: int = 512
-    n_heads: int = 8
-    ffn_dim: int = 512 * 4
+    embed_dim: int = 384
+    n_heads: int = 6
+    ffn_dim: int = 384 * 4
     eps: float = 1e-8
     n_blocks: int = 6
     n_experts: int = 6
+    k: int = 2 # top-k experts to route to
     capacity_factor: float = 1.25
     alpha_aux_loss: float = 1e-2
 

@@ -132,32 +132,33 @@ class MoE(nn.Module):
 
         x_flat = x.view(t, embed_dim) # t, embed_dim
         expert_probs: Tensor = self.router(x_flat) # t, e
-
-        # calculate aux loss
-        per_token_expert_prob, per_token_expert_idxs = expert_probs.max(dim=-1) # t, t 
-        ## fraction of tokens routed to an expert
-        # self here because we need to track these stats later
-        self.f_e = per_token_expert_idxs.bincount(minlength=self.n_experts) / t # e
-        ## total probability of tokens routed to an expert
-        self.p_e = expert_probs.mean(dim=0) # e
-        self.aux_loss = (
-            self.cfg.alpha_aux_loss * self.n_experts * (self.f_e * self.p_e).sum()
-        ).to(x.device)
-
+        topk_probs, topk_experts = expert_probs.topk(k=self.cfg.k, dim=-1)
         # calculate max. num of tokens to be routed to an expert
         cap = max(
-            math.ceil(t * self.capacity_factor / self.n_experts),
+            math.ceil(t * self.cfg.k * self.capacity_factor / self.n_experts),
             1
         )
         y_out = torch.zeros_like(x_flat)
-        self.drop_rate = 0
+        self.drop_rate, assigned_e, accepted = 0, torch.zeros(size=(self.n_experts,), device=x.device), 0
         for e in range(self.n_experts):
-            mask = per_token_expert_idxs == e
-            idxs_e = torch.nonzero(mask, as_tuple=False).squeeze(1)[:cap]
-            if idxs_e.shape[0] == 0:
+            mask = topk_experts == e
+            rows, cols = torch.nonzero(mask, as_tuple=True)
+            if rows.numel() == 0:
                 continue
-            y_out[idxs_e, :] = per_token_expert_prob[idxs_e].unsqueeze(-1) * self.experts[e](x_flat[idxs_e, :])
-            self.drop_rate += max(mask.sum().item() - cap, 0) / t
+            gates_e = topk_probs[rows, cols]
+            if rows.numel() > cap:
+                keep = gates_e.topk(cap).indices
+                rows = rows[keep]
+                gates_e = gates_e[keep]
+
+            y_out[rows, :] += gates_e.unsqueeze(-1) * self.experts[e](x_flat[rows, :]) # TODO: replace this with index_add_
+            accepted += rows.numel()
+            assigned_e[e] += rows.numel()
+        
+        self.drop_rate = 1 - (accepted / (self.cfg.k * t))
+        self.f_e = assigned_e / (self.cfg.k * t)
+        self.p_e = expert_probs.mean(dim=0)
+        self.aux_loss = (self.cfg.alpha_aux_loss * self.n_experts * (self.f_e * self.p_e).sum()).to(x.device)
 
         return y_out.view(bsz, seq_len, embed_dim)
 
@@ -244,11 +245,12 @@ class GPTMoE(nn.Module):
             "drop_rate": drop_avg
         }
     
-    def generate(self, x: Tensor, max_tokens: int=20) -> list[int]:
+    def generate(self, x: Tensor, max_tokens: int=20, temperature: float=0.7) -> list[int]:
         x = x.view(1, x.shape[0])
         for _ in range(max_tokens):
             logits = self(x)
-            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            next_token_probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
+            next_token = torch.multinomial(next_token_probs, num_samples=1)
             x = torch.cat([x, next_token], dim=1)
         
-        return x[0].tolist() 
+        return x[0].tolist()
