@@ -9,7 +9,7 @@ class ModelConfig(BaseModel):
     ffn_dim: int = 384 * 4
     eps: float = 1e-8
     n_blocks: int = 6
-    n_experts: int = 6
+    n_experts: int = 8
     k: int = 2 # top-k experts to route to
     capacity_factor: float = 1.25
     alpha_aux_loss: float = 1e-2

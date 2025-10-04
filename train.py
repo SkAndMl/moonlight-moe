@@ -1,41 +1,25 @@
-from data import ShardedDataset
-from torch.utils.data import DataLoader
 from models import TrainingConfig, ModelConfig
 from moe import GPTMoE
 from pathlib import Path
 from torch.optim import AdamW
-from typing import Literal
 from datetime import datetime
 from log import logger
 
-import torch, tiktoken, time, math, wandb
+import torch, tiktoken, time, math, wandb, util, json
 
-def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfig):
-    train_ds = ShardedDataset(config=training_cfg, shards_dir=train_dir)
-    test_ds = ShardedDataset(config=training_cfg, shards_dir=test_dir)
+util.set_seed()
 
-    train_dl = DataLoader(train_ds, batch_size=training_cfg.batch_size, shuffle=True)
-    test_dl = DataLoader(test_ds, batch_size=training_cfg.batch_size)
-    return train_dl, test_dl
-
-def get_device() -> Literal["cuda", "mps", "cpu"]:
-    if torch.cuda.is_available():
-        return "cuda"
-    elif torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-device = get_device()
+device = util.get_device()
 logger.info(f"training on {device}...")
 tokenizer = tiktoken.get_encoding("gpt2")
 training_cfg, model_cfg = TrainingConfig(device=device), ModelConfig()
-train_dl, test_dl = get_dataloaders(Path("shards/train"), Path("shards/validation"), training_cfg)
+train_dl, test_dl = util.get_dataloaders(Path("shards/train"), Path("shards/validation"), training_cfg)
 
 total_steps = len(train_dl) // training_cfg.accumulation_steps
 warmup_steps = int(0.02 * total_steps)
 
 wandb.init(
-    project=f"gpt-moe-training-{datetime.now().strftime('%d_%m_%Y')}",
+    project=f"gpt-moe-pretraining-{datetime.now().strftime('%d_%m_%Y')}",
     config={
         "model_cfg": model_cfg.model_dump(),
         "training_cfg": training_cfg.model_dump(),
@@ -58,14 +42,15 @@ def get_lr(it: int):
 
 @torch.inference_mode()
 def evaluate() -> torch.Tensor:
+    model.eval()
     loss_accum = 0
     for x, y in test_dl:
         x, y = x.to(device), y.to(device)
         bsz, seq_len = x.shape
         logits: torch.Tensor = model(x)
         loss = torch.nn.functional.cross_entropy(logits.view(bsz*seq_len, -1), y.view(-1,))
-        loss_accum += loss.detach() + model.moe_aux_loss()
-    
+        loss_accum += loss.detach()
+    model.train()
     return loss_accum / len(test_dl)
 
 
@@ -74,9 +59,10 @@ print(f"Total params: {sum(p.numel() for p in model.parameters())}")
 model = torch.compile(model)
 logger.info(f"compiled model...")
 
+nondecay_group = ['bias', 'norm']
 param_groups = {
-    "decay_params": [p for name, p in model.named_parameters() if 'bias' not in name],
-    "non_decay_params": [p for name, p in model.named_parameters() if 'bias' in name]
+    "decay_params": [p for name, p in model.named_parameters() if not any(_ in name for _ in nondecay_group)],
+    "non_decay_params": [p for name, p in model.named_parameters() if any(_ in name for _ in nondecay_group)]
 }
 optimizer = AdamW(
     params=[
@@ -84,6 +70,25 @@ optimizer = AdamW(
         {"params": param_groups["non_decay_params"], "weight_decay": 0}
     ]
 )
+
+CKPT_DIR = Path("checkpoints")
+CKPT_DIR.mkdir(exist_ok=True)
+best_test = float("inf")
+def save_ckpt(tag: str, step: int, val_loss: float=None):
+    state = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "training_cfg": training_cfg.model_dump(),
+        "model_cfg": model_cfg.model_dump(),
+    }
+    path = CKPT_DIR / f"{tag}.pt"
+    torch.save(state, path)
+    meta = {"tag": tag, "step": step, "val_loss": float(val_loss) if val_loss is not None else None}
+    with open(CKPT_DIR / f"{tag}.json", "w") as f:
+        json.dump(meta, f)
+    return path
+
 
 train_dl = iter(train_dl)
 for step in range(total_steps):
@@ -153,10 +158,18 @@ for step in range(total_steps):
 
     if (step + 1) % 200 == 0:
         test_loss = evaluate()
-        logger.info(f"step: {step + 1:>5} | val_loss: {test_loss:.4f}")
+        val = float(test_loss.item())
+        logger.info(f"step: {step + 1:>5} | val_loss: {val:.4f}")
         wandb.log({
             "test/loss": test_loss.item()
         })
+
+        save_ckpt("last", step + 1, val)
+
+        if val < best_test:
+            best_test = val
+            save_ckpt("best", step + 1, best_test)
+            logger.info(f"✅ new best @ step {step+1}: {best_test:.4f}")
 
     if (step + 1) % 200 == 0:
         start = "There was a"
