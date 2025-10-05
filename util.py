@@ -29,3 +29,15 @@ def get_device() -> Literal["cuda", "mps", "cpu"]:
     elif torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+def format_data_for_sft(system_prompt, user_content, assistant_content) -> str:
+    formatted_content = f"""
+<|system|>
+{system_prompt}
+<|user|>
+{user_content}
+<|assistant|>
+{assistant_content}
+<|endoftext|>
+"""
+    return formatted_content

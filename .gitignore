@@ -208,3 +208,5 @@ __marimo__/
 
 *.bin
 *.ipynb
+checkpoints/
+shards/
