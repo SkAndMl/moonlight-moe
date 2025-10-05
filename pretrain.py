@@ -4,6 +4,7 @@ from pathlib import Path
 from torch.optim import AdamW
 from datetime import datetime
 from log import logger
+from torch.cuda.amp import autocast
 
 import torch, tiktoken, time, math, wandb, util, json
 
@@ -11,6 +12,13 @@ util.set_seed()
 
 device = util.get_device()
 logger.info(f"training on {device}...")
+
+if device == "cuda":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+
 tokenizer = tiktoken.get_encoding("gpt2")
 training_cfg, model_cfg = TrainingConfig(device=device), ModelConfig()
 train_dl, test_dl = util.get_dataloaders(Path("shards/train"), Path("shards/validation"), training_cfg)
@@ -102,8 +110,19 @@ for step in range(total_steps):
         x, y = next(train_dl)
         x, y = x.to(device), y.to(device)
         bsz, seq_len = x.shape
-        logits: torch.Tensor = model(x)
-        loss = torch.nn.functional.cross_entropy(logits.view(bsz * seq_len, -1), y.view(-1,)) + model.moe_aux_loss()
+        if device == "cuda":
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits: torch.Tensor = model(x)
+                ce = torch.nn.functional.cross_entropy(
+                    logits.view(bsz * seq_len, -1), y.view(-1,)
+                )
+        else:
+            logits: torch.Tensor = model(x)
+            ce = torch.nn.functional.cross_entropy(
+                logits.view(bsz * seq_len, -1), y.view(-1,)
+            ) 
+        
+        loss = ce + model.moe_aux_loss()
         loss /= training_cfg.accumulation_steps
         loss.backward()
         loss_accum += loss.detach()
@@ -156,7 +175,7 @@ for step in range(total_steps):
                 "step": step + 1
             })
 
-    if (step + 1) % 200 == 0:
+    if (step + 1) % 200 == 0 or step == total_steps - 1:
         test_loss = evaluate()
         val = float(test_loss.item())
         logger.info(f"step: {step + 1:>5} | val_loss: {val:.4f}")

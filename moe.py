@@ -251,7 +251,8 @@ class GPTMoE(nn.Module):
                  temperature: float=0.7, 
                  top_p: float=0.9,
                  repetition_penalty: float=1.15,
-                 repetition_penalty_length: int=10) -> list[int]:
+                 repetition_penalty_length: int=10,
+                 stop_token_id: int = 50256) -> list[int]:
         assert x.ndim == 1
         x = x.view(1, x.shape[0])
         for _ in range(max_tokens):
@@ -273,5 +274,8 @@ class GPTMoE(nn.Module):
             sampled_idx = torch.multinomial(top_p_probs, num_samples=1)
             next_token = sorted_token_idxs.gather(1, sampled_idx)
             x = torch.cat([x, next_token], dim=1)
+
+            if next_token[0, 0].item() == stop_token_id:
+                break
         
         return x[0].tolist()
