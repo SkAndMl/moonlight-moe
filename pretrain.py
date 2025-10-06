@@ -4,7 +4,8 @@ from pathlib import Path
 from torch.optim import AdamW
 from datetime import datetime
 from log import logger
-from torch.cuda.amp import autocast
+from torch.utils.data import DataLoader
+from data import ShardedDataset
 
 import torch, tiktoken, time, math, wandb, util, json
 
@@ -18,10 +19,18 @@ if device == "cuda":
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
+def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfig):
+    train_ds = ShardedDataset(config=training_cfg, shards_dir=train_dir)
+    test_ds = ShardedDataset(config=training_cfg, shards_dir=test_dir)
+
+    train_dl = DataLoader(train_ds, batch_size=training_cfg.batch_size, shuffle=True)
+    test_dl = DataLoader(test_ds, batch_size=training_cfg.batch_size)
+    return train_dl, test_dl
+
 
 tokenizer = tiktoken.get_encoding("gpt2")
 training_cfg, model_cfg = TrainingConfig(device=device), ModelConfig()
-train_dl, test_dl = util.get_dataloaders(Path("shards/train"), Path("shards/validation"), training_cfg)
+train_dl, test_dl = get_dataloaders(Path("shards/train"), Path("shards/validation"), training_cfg)
 
 total_steps = len(train_dl) // training_cfg.accumulation_steps
 warmup_steps = int(0.02 * total_steps)

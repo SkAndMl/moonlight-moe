@@ -1,7 +1,6 @@
 from pathlib import Path
 from models import TrainingConfig
 from typing import Literal
-from data import ShardedDataset
 from torch.utils.data import DataLoader
 import torch, random, numpy as np
 
@@ -14,14 +13,6 @@ def set_seed(seed=2406):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-
-def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfig):
-    train_ds = ShardedDataset(config=training_cfg, shards_dir=train_dir)
-    test_ds = ShardedDataset(config=training_cfg, shards_dir=test_dir)
-
-    train_dl = DataLoader(train_ds, batch_size=training_cfg.batch_size, shuffle=True)
-    test_dl = DataLoader(test_ds, batch_size=training_cfg.batch_size)
-    return train_dl, test_dl
 
 def get_device() -> Literal["cuda", "mps", "cpu"]:
     if torch.cuda.is_available():
@@ -41,3 +32,18 @@ def format_data_for_sft(system_prompt, user_content, assistant_content) -> str:
 <|endoftext|>
 """
     return formatted_content
+
+
+def get_x_y_for_sft(system_prompt: str, user_content: str, assistant_content: str) -> tuple[str]:
+    x = f"""
+<|system|>
+{system_prompt.strip()}
+<|user|>
+{user_content.strip()}
+<|assistant|>
+"""
+    y = f"""
+{assistant_content.strip()}
+<|endoftext|>
+"""
+    return x, y
