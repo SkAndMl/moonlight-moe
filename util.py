@@ -21,6 +21,11 @@ def get_device() -> Literal["cuda", "mps", "cpu"]:
         return "mps"
     return "cpu"
 
+def get_autocast_dtype(device: str):
+    if device == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return None
+
 def format_data_for_sft(system_prompt, user_content, assistant_content) -> str:
     formatted_content = f"""
 <|system|>
