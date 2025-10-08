@@ -5,18 +5,31 @@ from moe import GPTMoE
 
 device = util.get_device()
 cp = torch.load("checkpoints/pretrain.pt", map_location=device)
-model_cfg = models.ModelConfig(**cp["model_config"])
+model_cfg = models.ModelConfig(**cp["model_cfg"])
 training_cfg = models.TrainingConfig(device=device)
 tokenizer = tiktoken.get_encoding("gpt2")
 ds = SFTDataset(pathlib.Path("sft_data.json"), tokenizer)
 train_dl = DataLoader(ds, batch_size=training_cfg.batch_size, shuffle=True)
 
 
-model = torch.compile(GPTMoE(model_cfg))
+model = GPTMoE(model_cfg).to(device)
+model = torch.compile(model)
 model.load_state_dict(cp["model"])
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-total_steps = len(training_cfg) // training_cfg.accumulation_steps
+non_decay_names = ["norm", "bias"]
+param_groups = {
+    "non_decay": [p for name, p in model.named_parameters() if any(_ in name for _ in non_decay_names)],
+    "decay": [p for name, p in model.named_parameters() if not any(_ in name for _ in non_decay_names)]
+}
+
+optimizer = torch.optim.AdamW(
+    params=[
+        {"params": param_groups["non_decay"], "weight_decay": 0},
+        {"params": param_groups["decay"], "weight_decay": training_cfg.weight_decay}
+    ]
+)
+
+total_steps = len(train_dl) // training_cfg.accumulation_steps
 warmup_steps = int(0.02 * total_steps)
 
 def get_lr(it: int):
@@ -30,22 +43,27 @@ def get_lr(it: int):
     else:
         return min_lr
 
-prompt_mask = torch.tensor([torch.arange(0, 512) for _ in range(training_cfg.batch_size)]).to(device)
+prompt_mask = torch.vstack([torch.arange(0, 512) for _ in range(training_cfg.batch_size)]).to(device)
 
+print("training...")
 train_dl = iter(train_dl)
 for step in range(total_steps):
     optimizer.zero_grad()
     loss_accum = 0
-    for _ in training_cfg.accumulation_steps:
+    for _ in range(training_cfg.accumulation_steps):
         tokens, prompt_lens, eot_lens = next(train_dl)
-        tokens, prompt_lens, eot_lens = tokens.to(device), prompt_lens.to(device), eot_lens.to(device)
-        x, y = tokens[:, -1], tokens[:, 1:] # bsz, 512; bsz, 512
+        tokens, prompt_lens, eot_lens = tokens.to(device), prompt_lens.unsqueeze(-1).to(device), eot_lens.to(device)
+        x, y = tokens[:, :-1], tokens[:, 1:] # bsz, 512; bsz, 512
         logits: torch.Tensor = model(x)
-        y_masked = torch.where(prompt_mask < prompt_lens-1, -100, y)
+        y_masked = torch.where(prompt_mask < prompt_lens - 1, -100, y)
         loss = torch.nn.functional.cross_entropy(logits.view(training_cfg.batch_size * 512, -1), y_masked.view(-1,), ignore_index=-100)
         loss /= training_cfg.accumulation_steps
         loss.backward()
         loss_accum += loss.detach().item()
+    
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
     optimizer.step()
 
     print(f"step: {step + 1:>5} | loss: {loss_accum:.4f}")

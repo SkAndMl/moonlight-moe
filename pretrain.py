@@ -50,7 +50,6 @@ def get_lr(it: int):
     min_lr, max_lr = training_cfg.min_lr, training_cfg.max_lr
     if it < warmup_steps:
         return ((it + 1) / warmup_steps) * max_lr
-    
     elif warmup_steps <= it <= total_steps:
         step_ratio = (it - warmup_steps) / (total_steps - warmup_steps)
         return min_lr + (1/2) * (max_lr - min_lr) * (1 + math.cos(math.pi * step_ratio))

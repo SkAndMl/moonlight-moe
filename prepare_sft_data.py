@@ -80,7 +80,7 @@ def get_sft_data_from_roc():
         "task": [],
         "assistant_content": []
     }
-    while len(sft_dict["user_content"]) <= SAMPLE_SIZE_TARGET_FOR_SHORT_STORY_GENERATION:
+    while len(sft_dict["user_content"]) < SAMPLE_SIZE_TARGET_FOR_SHORT_STORY_GENERATION:
         random_idx = random.choice(list(idxs))
         user_content = prompts.STORY_GENERATION_SHORT_USER_PROMPT.format(user_content=ds["train"][random_idx]["storytitle"])
         assistant_content = "\n".join([ds["train"][random_idx][f"sentence{i}"] for i in range(1, 6)])
@@ -111,7 +111,7 @@ def get_sft_data_from_story_cloze():
         "task": [],
         "assistant_content": []
     }
-    while len(sft_dict["user_content"]) <= SAMPLE_SIZE_TARGET_FOR_INFERENCE:
+    while len(sft_dict["user_content"]) < SAMPLE_SIZE_TARGET_FOR_INFERENCE:
         random_idx = random.choice(list(idxs))
         prompt, chosen, rejected = ds[random_idx]["prompt"], ds[random_idx]["chosen"], ds[random_idx]["rejected"]
         if random.random() > 0.5:
