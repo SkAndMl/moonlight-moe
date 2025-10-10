@@ -1,6 +1,6 @@
 import torch, math
 
-from models import ModelConfig
+from config import ModelConfig
 from torch import nn, Tensor
 from torch.nn import functional as F
 
@@ -254,6 +254,7 @@ class GPTMoE(nn.Module):
                  repetition_penalty_length: int=10,
                  stop_token_id: int = 50256) -> list[int]:
         assert x.ndim == 1
+        input_len = x.shape[0]
         x = x.view(1, x.shape[0])
         for _ in range(max_tokens):
             logits = self(x)
@@ -278,4 +279,4 @@ class GPTMoE(nn.Module):
             if next_token[0, 0].item() == stop_token_id:
                 break
         
-        return x[0].tolist()
+        return x[0].tolist()[input_len:]

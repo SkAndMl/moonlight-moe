@@ -1,7 +1,7 @@
 from torch.utils.data import Dataset
 from pathlib import Path
-from models import TrainingConfig
-import numpy as np, torch, typing, json, prompts, util
+from config import TrainingConfig
+import numpy as np, torch, typing
 
 class ShardedDataset(Dataset):
 
@@ -10,7 +10,7 @@ class ShardedDataset(Dataset):
         self.shards_dir = shards_dir
         self.shard_paths = list(shards_dir.glob("shard_*.bin"))
 
-        self.memmaps = [np.memmap(shard_path, dtype=np.uint16) for i, shard_path in enumerate(self.shard_paths)]
+        self.memmaps = [np.memmap(shard_path, dtype=np.uint16) for _, shard_path in enumerate(self.shard_paths)]
         self.cum_seqs = np.cumsum([len(self.memmaps[i]) // (self.config.ctx_size + 1) for i in range(len(self.memmaps))])
     
     def __len__(self):
@@ -25,41 +25,52 @@ class ShardedDataset(Dataset):
                 return x.long(), y.long()
 
 
-class SFTDataset(Dataset):
-
-    def __init__(self, sft_data_path: Path, tokenizer) -> None:
-
-        with open(sft_data_path, "r") as f:
-            self.sft_data = json.loads(f.read())
-
-        self.tokenizer = tokenizer
-
-    def __len__(self) -> int: 
-        return len(self.sft_data["user_content"])
-
-    def __getitem__(self, idx: int):
+class SFTShardedDataset(Dataset):
+    
+    def __init__(self, shards_dir: Path) -> None:
+        self.shards_dir = Path(shards_dir)
         
-        task: typing.Literal["generate_long", "generate_short", "summarize", "inference"] = self.sft_data["task"][idx]
-        match task:
-            case "inference":
-                user_content = prompts.INFERENCE_USER_PROMPT.format(**self.sft_data["user_content"][idx])
-                assistant_content = self.sft_data["assistant_content"][idx]
-                x_str, y_str = util.get_x_y_for_sft(prompts.SYSTEM_PROMPT, user_content, assistant_content)
-            case "generate_long":
-                user_content = prompts.STORY_GENERATION_LONG_USER_PROMPT.format(user_content=self.sft_data["user_content"][idx])
-                x_str, y_str = util.get_x_y_for_sft(prompts.SYSTEM_PROMPT, user_content, self.sft_data["assistant_content"][idx])
-            case "generate_short":
-                user_content = prompts.STORY_GENERATION_SHORT_USER_PROMPT.format(user_content=self.sft_data["user_content"][idx])
-                x_str, y_str = util.get_x_y_for_sft(prompts.SYSTEM_PROMPT, user_content, self.sft_data["assistant_content"][idx])
-            case "summarize":
-                user_content = prompts.SUMMARIZE_USER_PROMPT.format(story=self.sft_data["user_content"][idx])
-                x_str, y_str = util.get_x_y_for_sft(prompts.SYSTEM_PROMPT, user_content, self.sft_data["assistant_content"][idx])
+        if not self.shards_dir.exists():
+            raise ValueError(f"Shards directory does not exist: {self.shards_dir}")
         
-        x_tokens = self.tokenizer.encode(x_str, allowed_special="all")
-        y_tokens = self.tokenizer.encode(y_str, allowed_special="all")
-
-        tokens = x_tokens + y_tokens
-        if len(tokens) < 513:
-            tokens.extend([50256] * (513 - len(tokens)))
+        self.shard_paths = sorted(self.shards_dir.glob("shard_*.bin"))
         
-        return torch.tensor(tokens).long(), len(x_tokens), len(x_tokens + y_tokens)
+        if len(self.shard_paths) == 0:
+            raise ValueError(f"No shard files found in {self.shards_dir}")
+        
+        print(f"Found {len(self.shard_paths)} shards in {self.shards_dir}")
+        
+        self.memmaps = []
+        for shard_path in self.shard_paths:
+            memmap = np.memmap(shard_path, dtype=np.uint16, mode='r')
+            
+            num_rows = len(memmap) // 515
+            if len(memmap) % 515 != 0:
+                print(f"Warning: {shard_path.name} size is not a multiple of 515, truncating")
+            
+            shaped = memmap[:num_rows * 515].reshape(-1, 515)
+            self.memmaps.append(shaped)
+        
+        shard_sizes = [len(memmap) for memmap in self.memmaps]
+        self.cum_seqs = np.cumsum(shard_sizes)
+        
+        print(f"Total samples: {self.cum_seqs[-1]:,}")
+    
+    def __len__(self) -> int:
+        return int(self.cum_seqs[-1])
+    
+    def __getitem__(self, idx: int) -> typing.Tuple[torch.Tensor, int, int]:
+        shard_idx = int(np.searchsorted(self.cum_seqs, idx, side='right'))
+        
+        if shard_idx == 0:
+            local_idx = idx
+        else:
+            local_idx = idx - int(self.cum_seqs[shard_idx - 1])
+        
+        row = self.memmaps[shard_idx][local_idx]
+        
+        tokens = torch.from_numpy(row[:513].copy()).long()
+        prompt_len = int(row[513])
+        content_len = int(row[514])
+        
+        return tokens, prompt_len, content_len

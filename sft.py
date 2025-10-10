@@ -1,4 +1,4 @@
-import pathlib, tiktoken, models, util, torch, math
+import pathlib, tiktoken, config, util, torch, math
 from data import SFTDataset
 from torch.utils.data import DataLoader
 from hf_utils import load_model_from_hf, upload_to_hf
@@ -7,7 +7,7 @@ from torch.nn import functional as F
 
 device = util.get_device()
 autocast_dtype = util.get_autocast_dtype(device)
-training_cfg = models.TrainingConfig(device=device)
+training_cfg = config.TrainingConfig(device=device)
 
 if device == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -76,19 +76,20 @@ for step in range(total_steps):
         tokens, prompt_lens, eot_lens = next(train_dl)
         tokens, prompt_lens, eot_lens = tokens.to(device), prompt_lens.unsqueeze(-1).to(device), eot_lens.to(device)
         x, y = tokens[:, :-1], tokens[:, 1:] # bsz, 512; bsz, 512
-        y_masked = torch.where(prompt_mask < prompt_lens - 1, -100, y)
+        bsz, seq_len = x.shape
+        y_masked = torch.where(prompt_mask[:bsz, :] < prompt_lens - 1, -100, y)
         if autocast_dtype is not None:
             with torch.amp.autocast(device, autocast_dtype):
                 logits: torch.Tensor = model(x)
                 ce_loss = F.cross_entropy(
-                    logits.view(training_cfg.batch_size * 512, -1),
+                    logits.view(bsz * seq_len, -1),
                     y_masked.view(-1,),
                     ignore_index=-100
                 )
         else:
             logits: torch.Tensor = model(x)
             ce_loss = F.cross_entropy(
-                logits.view(training_cfg.batch_size * 512, -1),
+                logits.view(bsz * seq_len, -1),
                 y_masked.view(-1,),
                 ignore_index=-100
             )

@@ -1,4 +1,4 @@
-from models import TrainingConfig, ModelConfig
+from config import TrainingConfig, ModelConfig
 from moe import GPTMoE
 from pathlib import Path
 from torch.optim import AdamW

@@ -1,151 +1,328 @@
-import datasets, re, random, tiktoken, util, prompts, os, json
-from dotenv import load_dotenv, find_dotenv
+import argparse
+import json
+import random
+import numpy as np
+import tiktoken
+from pathlib import Path
+from config import SFTConfig
+from data_processors import (
+    TinyStoriesProcessor,
+    ROCStoriesProcessor,
+    StoryClozeProcessor,
+    WritingPromptsProcessor,
+)
+from sampler import sample_all_tasks
+import prompts
+import util
 
-load_dotenv(find_dotenv())
 
-SAMPLE_SIZE_TARGET_FOR_LONG_STORY_GENERATION = 9440 # 60% of 16400
-SAMPLE_SIZE_TARGET_FOR_SUMMARY = 1640 # 10% of 16400
-SAMPLE_SIZE_TARGET_FOR_SHORT_STORY_GENERATION = 1640 # 10% of 16400
-SAMPLE_SIZE_TARGET_FOR_INFERENCE = 3278 # 20% of 16400
-
-tokenizer = tiktoken.get_encoding("gpt2")
+# Sharding configuration
+SAMPLES_PER_SHARD = 10000
 
 
-def parse_sections(text, separate_section):
-    section_pattern = r'(\w+):\s*(.*?)(?=\n\w+:|$)'
-    sections = re.findall(section_pattern, text, re.DOTALL)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Prepare SFT data from multiple datasets with train/val split",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     
-    story_section = ""
-    other_sections = []
+    parser.add_argument(
+        "--total_samples",
+        type=int,
+        required=True,
+        help="Total number of samples to generate (train + val combined)"
+    )
     
-    for section_name, content in sections:
-        if section_name == separate_section:
-            story_section = f"{section_name}: {content.strip()}"
-        else:
-            other_sections.append(f"{section_name}: {content.strip()}")
+    parser.add_argument(
+        "--val_split",
+        type=float,
+        default=0.1,
+        help="Fraction of data for validation (0.0 to 1.0)"
+    )
     
-    return other_sections, story_section
+    parser.add_argument(
+        "--token_limit",
+        type=int,
+        default=513,
+        help="Maximum token count per sample (513 allows for 512-token sequences after x/y shift)"
+    )
+    
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=2406,
+        help="Random seed for reproducibility"
+    )
+    
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=".",
+        help="Directory to save output files"
+    )
+    
+    parser.add_argument(
+        "--output_prefix",
+        type=str,
+        default="sft_data",
+        help="Prefix for output filenames"
+    )
+    
+    parser.add_argument(
+        "--output_format",
+        type=str,
+        default="json",
+        choices=["json", "shards", "both"],
+        help="Output format: 'json' (dict format), 'shards' (binary shards), or 'both'"
+    )
+    
+    return parser.parse_args()
 
 
-def get_sft_data_from_tinystories() -> dict:
-    ds = datasets.load_dataset("skeskinen/TinyStories-Instruct-hf", token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
-    idxs = set(range(len(ds["train"])))
-    story_generation_count, summary_count = 0, 0
-    sft_dict = {
-        "user_content": [],
-        "task": [],
-        "assistant_content": []
-    }
-    while not (story_generation_count == SAMPLE_SIZE_TARGET_FOR_LONG_STORY_GENERATION and summary_count == SAMPLE_SIZE_TARGET_FOR_SUMMARY):
-        random_idx = random.choice(list(idxs))
-        other_sections, story_section = parse_sections(ds["train"][random_idx]["text"], "Story")
-        if len(other_sections) == 1 and "Summary:" in other_sections[0] and summary_count < SAMPLE_SIZE_TARGET_FOR_SUMMARY:
-            user_content = prompts.SUMMARIZE_USER_PROMPT.format(story=story_section)
-            tokens = tokenizer.encode(
-                util.format_data_for_sft(prompts.SYSTEM_PROMPT, user_content, other_sections[0]),
-                allowed_special="all"
-            )
-            if len(tokens) > 513:
-                continue
-            sft_dict["user_content"].append(story_section)
-            sft_dict["task"].append("summarize")
-            sft_dict["assistant_content"].append(other_sections[0])
-            summary_count += 1
-        elif story_generation_count < SAMPLE_SIZE_TARGET_FOR_LONG_STORY_GENERATION:
-            other_sections = [_ for _ in other_sections if "Summary" not in _]
-            user_content = prompts.STORY_GENERATION_LONG_USER_PROMPT.format(user_content="\n".join(other_sections))
-            tokens = tokenizer.encode(
-                util.format_data_for_sft(prompts.SYSTEM_PROMPT, user_content, story_section),
-                allowed_special="all"
-            )
-            if len(tokens) > 513:
-                continue
-            sft_dict["user_content"].append("\n".join(other_sections))
-            sft_dict["task"].append("generate_long")
-            sft_dict["assistant_content"].append(story_section)
-            story_generation_count += 1
-
-        idxs.remove(random_idx)
-        if len(idxs) == 0:
-            break
-
-    return sft_dict
+def print_config_summary(config: SFTConfig):
+    print("=" * 70)
+    print("SFT DATA PREPARATION")
+    print("=" * 70)
+    print(f"Total samples: {config.total_samples:,}")
+    print(f"Token limit: {config.token_limit}")
+    print(f"Validation split: {config.val_split:.1%}")
+    print(f"Random seed: {config.random_seed}")
+    print()
+    
+    train_count, val_count = config.get_train_val_counts()
+    print(f"Train samples: {train_count:,}")
+    print(f"Val samples: {val_count:,}")
+    print()
+    
+    print("Task distribution:")
+    targets = config.get_target_counts()
+    for task, count in targets.items():
+        pct = config.task_distribution[task]
+        print(f"  {task:20s}: {count:6,} samples ({pct:.1%})")
+    print()
 
 
-def get_sft_data_from_roc():
-    ds = datasets.load_dataset("igormorgado/ROCStories2018", token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
-    idxs = set(range(len(ds["train"])))
-    sft_dict = {
-        "user_content": [],
-        "task": [],
-        "assistant_content": []
-    }
-    while len(sft_dict["user_content"]) < SAMPLE_SIZE_TARGET_FOR_SHORT_STORY_GENERATION:
-        random_idx = random.choice(list(idxs))
-        user_content = prompts.STORY_GENERATION_SHORT_USER_PROMPT.format(user_content=ds["train"][random_idx]["storytitle"])
-        assistant_content = "\n".join([ds["train"][random_idx][f"sentence{i}"] for i in range(1, 6)])
-        tokens = tokenizer.encode(
-            util.format_data_for_sft(prompts.SYSTEM_PROMPT, user_content, assistant_content),
-            allowed_special="all"
-        )
-        if len(tokens) > 513:
-            continue
+def print_final_summary(train_data: dict, val_data: dict, all_stats: dict):
+    print("=" * 70)
+    print("SAMPLING COMPLETE")
+    print("=" * 70)
+    
+    train_total = len(train_data["user_content"])
+    val_total = len(val_data["user_content"])
+    
+    print(f"Total train samples: {train_total:,}")
+    print(f"Total val samples: {val_total:,}")
+    print(f"Total samples: {train_total + val_total:,}")
+    print()
+    
+    print("Detailed statistics by task:")
+    for task_type, processors_stats in all_stats.items():
+        print(f"\n  {task_type}:")
+        for processor_name, stats in processors_stats.items():
+            print(f"    {processor_name}:")
+            print(f"      Target: {stats['target_count']:,}")
+            print(f"      Actual: {stats['actual_count']:,}")
+            print(f"      Train: {stats['train_count']:,}")
+            print(f"      Val: {stats['val_count']:,}")
+            print(f"      Tokens rejected: {stats['tokens_rejected']:,}")
+            print(f"      Parse failed: {stats['parse_failed']:,}")
+            if stats['dataset_exhausted']:
+                print(f"      ⚠️  WARNING: Dataset exhausted!")
+    
+    print()
+
+
+def save_json_data(data: dict, filepath: Path):
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Saved JSON to: {filepath}")
+
+
+def process_sample_for_sharding(
+    user_content,
+    assistant_content,
+    task_type: str,
+    tokenizer,
+    token_limit: int = 513
+) -> tuple:
+    
+    user_content_formatted = prompts.format_user_content(task_type, user_content)
+    
+    formatted = util.format_data_for_sft(
+        prompts.SYSTEM_PROMPT,
+        user_content_formatted,
+        assistant_content
+    )
+    
+    tokens = tokenizer.encode(formatted, allowed_special="all")
+    content_len = len(tokens)
+    
+    x_part, _ = util.get_x_y_for_sft(
+        prompts.SYSTEM_PROMPT,
+        user_content_formatted,
+        assistant_content
+    )
+    prompt_tokens = tokenizer.encode(x_part, allowed_special="all")
+    prompt_len = len(prompt_tokens)
+    
+    if content_len > token_limit:
+        raise ValueError(f"Sample exceeds token limit: {content_len} > {token_limit}")
+    
+    if prompt_len >= content_len:
+        raise ValueError(f"Invalid lengths: prompt_len={prompt_len} >= content_len={content_len}")
+    
+    if content_len < token_limit:
+        padding = [tokenizer.eot_token] * (token_limit - content_len)
+        tokens.extend(padding)
+    
+    tokens_array = np.array(tokens, dtype=np.uint16)
+    
+    return tokens_array, prompt_len, content_len
+
+
+def write_shards(data: dict, output_dir: Path, split_name: str, tokenizer):
+    print(f"\nWriting {split_name} shards...")
+    
+    shards_dir = output_dir / "shards" / split_name
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    
+    num_samples = len(data["user_content"])
+    shard_buffer = []
+    shard_id = 0
+    
+    for i in range(num_samples):
+        user_content = data["user_content"][i]
+        assistant_content = data["assistant_content"][i]
+        task_type = data["task"][i]
         
-        sft_dict["user_content"].append(ds["train"][random_idx]["storytitle"])
-        sft_dict["task"].append("generate_short")
-        sft_dict["assistant_content"].append(assistant_content)
-        idxs.remove(random_idx)
-
-        if len(idxs) == 0:
-            break
-
-    return sft_dict
-
-
-def get_sft_data_from_story_cloze():
-    ds = datasets.load_dataset("lecslab/story_cloze", token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
-    ds = datasets.concatenate_datasets([ds["train"], ds["test"]])
-    idxs = set(range(len(ds)))
-    sft_dict = {
-        "user_content": [],
-        "task": [],
-        "assistant_content": []
-    }
-    while len(sft_dict["user_content"]) < SAMPLE_SIZE_TARGET_FOR_INFERENCE:
-        random_idx = random.choice(list(idxs))
-        prompt, chosen, rejected = ds[random_idx]["prompt"], ds[random_idx]["chosen"], ds[random_idx]["rejected"]
-        if random.random() > 0.5:
-            user_content = prompts.INFERENCE_USER_PROMPT.format(paragraph=prompt, option_1=rejected, option_2=chosen)
-        else:
-            user_content = prompts.INFERENCE_USER_PROMPT.format(paragraph=prompt, option_1=chosen, option_2=rejected)
-        assistant_content = chosen
-        tokens = tokenizer.encode(
-            util.format_data_for_sft(prompts.SYSTEM_PROMPT, user_content, assistant_content),
-            allowed_special="all"
-        )
-        if len(tokens) > 513:
-            continue
+        try:
+            tokens_array, prompt_len, content_len = process_sample_for_sharding(
+                user_content,
+                assistant_content,
+                task_type,
+                tokenizer
+            )
+            
+            row = np.concatenate([tokens_array, [prompt_len, content_len]]).astype(np.uint16)
+            shard_buffer.append(row)
+            
+            if len(shard_buffer) >= SAMPLES_PER_SHARD:
+                shard_array = np.array(shard_buffer, dtype=np.uint16)  # Shape: (N, 515)
+                shard_path = shards_dir / f"shard_{shard_id:05d}.bin"
+                shard_array.tofile(shard_path)
+                print(f"  Wrote {len(shard_buffer)} samples to {shard_path.name}")
+                
+                shard_buffer = []
+                shard_id += 1
         
-        sft_dict["user_content"].append({"paragraph": prompt, "option_1": chosen, "option_2": rejected})
-        sft_dict["task"].append("inference")
-        sft_dict["assistant_content"].append(assistant_content)
-        idxs.remove(random_idx)
-
-        if len(idxs) == 0:
-            break
+        except Exception as e:
+            print(f"  Warning: Failed to process sample {i} for sharding: {e}")
+            continue
     
-    return sft_dict
+    if len(shard_buffer) > 0:
+        shard_array = np.array(shard_buffer, dtype=np.uint16)
+        shard_path = shards_dir / f"shard_{shard_id:05d}.bin"
+        shard_array.tofile(shard_path)
+        print(f"  Wrote {len(shard_buffer)} samples to {shard_path.name}")
+        shard_id += 1
+    
+    print(f"Finished writing {shard_id} shards to {shards_dir}")
+    
+    metadata = {
+        "split": split_name,
+        "total_samples": num_samples,
+        "samples_per_shard": SAMPLES_PER_SHARD,
+        "num_shards": shard_id,
+        "token_limit": 513,
+        "row_size": 515,
+        "eot_token_id": tokenizer.eot_token,
+        "format": "Each row: [513 tokens (uint16), prompt_len (uint16), content_len (uint16)]"
+    }
+    
+    metadata_path = shards_dir / "metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Wrote metadata to {metadata_path}")
+
+
+def main():
+    args = parse_args()
+    
+    # Create config
+    config = SFTConfig(
+        total_samples=args.total_samples,
+        token_limit=args.token_limit,
+        val_split=args.val_split,
+        random_seed=args.random_seed
+    )
+    
+    # Print configuration
+    print_config_summary(config)
+    
+    processors_map = {
+        "generate_long": [
+            TinyStoriesProcessor()
+        ],
+        "generate_creative": [
+            WritingPromptsProcessor()
+        ],
+        "summarize": [
+            TinyStoriesProcessor()
+        ],
+        "generate_short": [
+            ROCStoriesProcessor()
+        ],
+        "inference": [
+            StoryClozeProcessor(random_seed=config.random_seed)
+        ]
+    }
+    
+    print("Initialized processors:")
+    for task, processors in processors_map.items():
+        processor_names = [p.__class__.__name__ for p in processors]
+        print(f"  {task}: {', '.join(processor_names)}")
+    print()
+    print("=" * 70)
+    print()
+    
+    train_data, val_data, all_stats = sample_all_tasks(config, processors_map)
+    
+    print_final_summary(train_data, val_data, all_stats)
+    
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    
+    if args.output_format in ["json", "both"]:
+        print("\nSaving JSON files...")
+        train_path = output_dir / f"{args.output_prefix}_train.json"
+        val_path = output_dir / f"{args.output_prefix}_val.json"
+        
+        save_json_data(train_data, train_path)
+        save_json_data(val_data, val_path)
+        
+        stats_path = output_dir / f"{args.output_prefix}_stats.json"
+        save_json_data(all_stats, stats_path)
+    
+    if args.output_format in ["shards", "both"]:
+        print("\nCreating binary shards...")
+        tokenizer = tiktoken.get_encoding("gpt2")
+        
+        write_shards(train_data, output_dir, "train", tokenizer)
+        write_shards(val_data, output_dir, "val", tokenizer)
+    
+    print()
+    print("=" * 70)
+    print("DONE!")
+    print("=" * 70)
+    
+    if args.output_format == "json":
+        print(f"\nJSON files saved to: {output_dir}")
+    elif args.output_format == "shards":
+        print(f"\nBinary shards saved to: {output_dir / 'shards'}")
+    else:  # both
+        print(f"\nJSON files saved to: {output_dir}")
+        print(f"Binary shards saved to: {output_dir / 'shards'}")
 
 
 if __name__ == "__main__":
-
-    sft_dict = get_sft_data_from_tinystories()
-    _tmp = get_sft_data_from_roc()
-    for key in _tmp:
-        sft_dict[key].extend(_tmp[key])
-    _tmp = get_sft_data_from_story_cloze()
-    for key in _tmp:
-        sft_dict[key].extend(_tmp[key])
-    
-    with open("sft_data.json", "w") as f:
-        json.dump(sft_dict, f)
+    main()

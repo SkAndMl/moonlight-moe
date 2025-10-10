@@ -1,7 +1,7 @@
 from huggingface_hub import HfApi, hf_hub_download, create_repo
 from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
-from models import ModelConfig
+from config import ModelConfig
 from moe import GPTMoE
 import torch, os
 

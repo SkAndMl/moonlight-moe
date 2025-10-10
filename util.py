@@ -1,5 +1,5 @@
 from pathlib import Path
-from models import TrainingConfig
+from config import TrainingConfig
 from typing import Literal
 from torch.utils.data import DataLoader
 import torch, random, numpy as np
