@@ -326,3 +326,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python3.11 prepare_sft_data.py --total_samples 300000 --val_split 0.1 --token_limit 513 --random_seed 2406 --output_dir sft_data --output_prefix sft --output_format both
