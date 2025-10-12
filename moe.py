@@ -132,7 +132,7 @@ class MoE(nn.Module):
 
         x_flat = x.view(t, embed_dim) # t, embed_dim
         expert_probs: Tensor = self.router(x_flat) # t, e
-        topk_probs, topk_experts = expert_probs.topk(k=self.cfg.k, dim=-1)
+        topk_probs, topk_experts = expert_probs.topk(k=self.cfg.k, dim=-1) # (t, k), (t, k)
         # calculate max. num of tokens to be routed to an expert
         cap = max(
             math.ceil(t * self.cfg.k * self.capacity_factor / self.n_experts),
@@ -141,12 +141,14 @@ class MoE(nn.Module):
         y_out = torch.zeros_like(x_flat)
         self.drop_rate, assigned_e, accepted = 0, torch.zeros(size=(self.n_experts,), device=x.device), 0
         for e in range(self.n_experts):
-            mask = topk_experts == e
+            # calculate mask for tokens being routed to an expert
+            mask = topk_experts == e # (t, k)
             rows, cols = torch.nonzero(mask, as_tuple=True)
             if rows.numel() == 0:
                 continue
-            gates_e = topk_probs[rows, cols]
+            gates_e = topk_probs[rows, cols] # get per expert per token prob
             if rows.numel() > cap:
+                # cap the token count to top probs
                 keep = gates_e.topk(cap).indices
                 rows = rows[keep]
                 gates_e = gates_e[keep]
