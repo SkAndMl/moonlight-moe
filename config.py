@@ -5,7 +5,7 @@ from typing import Dict
 class ModelConfig(BaseModel):
     base: int = 10000
     vocab_size: int = 50304
-    ctx_size: int = 512
+    ctx_size: int = 1024
     embed_dim: int = 384
     n_heads: int = 6
     ffn_dim: int = 384 * 4
@@ -17,7 +17,7 @@ class ModelConfig(BaseModel):
     alpha_aux_loss: float = 1e-2
 
 class TrainingConfig(BaseModel):
-    ctx_size: int = 512
+    ctx_size: int = 1024
     batch_size: int = 16
     min_lr: float = 6e-5
     max_lr: float = 6e-4
