@@ -6,12 +6,14 @@ from datetime import datetime
 from log import logger
 from torch.utils.data import DataLoader
 from data import ShardedDataset
+from hf_utils import upload_to_hf
 
 import torch, tiktoken, time, math, wandb, util, json
 
 util.set_seed()
 
 device = util.get_device()
+autocast_dtype = util.get_autocast_dtype(device)
 logger.info(f"training on {device}...")
 
 if device == "cuda":
@@ -30,7 +32,7 @@ def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfi
 
 tokenizer = tiktoken.get_encoding("gpt2")
 training_cfg, model_cfg = TrainingConfig(device=device), ModelConfig()
-train_dl, test_dl = get_dataloaders(Path("shards/train"), Path("shards/validation"), training_cfg)
+train_dl, test_dl = get_dataloaders(Path("pretrain_data/train"), Path("pretrain_data/validation"), training_cfg)
 
 total_steps = len(train_dl) // training_cfg.accumulation_steps
 warmup_steps = int(0.02 * total_steps)
@@ -87,7 +89,7 @@ optimizer = AdamW(
     ]
 )
 
-CKPT_DIR = Path("checkpoints")
+CKPT_DIR = Path("checkpoints/pretrain")
 CKPT_DIR.mkdir(exist_ok=True)
 best_test = float("inf")
 def save_ckpt(tag: str, step: int, val_loss: float=None):
@@ -118,8 +120,8 @@ for step in range(total_steps):
         x, y = next(train_dl)
         x, y = x.to(device), y.to(device)
         bsz, seq_len = x.shape
-        if device == "cuda":
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        if autocast_dtype is not None:
+            with torch.autocast(device_type=device, dtype=autocast_dtype):
                 logits: torch.Tensor = model(x)
                 ce = torch.nn.functional.cross_entropy(
                     logits.view(bsz * seq_len, -1), y.view(-1,)
@@ -207,3 +209,8 @@ for step in range(total_steps):
             "generation": wandb.Html(f"<p><b>Prompt:</d> {start}<br><b>Generated:</b> {gen_text}</p>"),
             "step": step + 1
         })
+
+upload_to_hf(
+    CKPT_DIR / "best.pt",
+    "SkAndMl/moonlight-moe-pretrain"
+)

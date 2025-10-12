@@ -109,3 +109,6 @@ for split in {"train", "validation"}:
                 block.tofile(f)
             
             shard_id += 1
+        
+    if shard_id % 5 == 0:
+        print(f"[{split}] Shard {shard_id} | Tokens: {sum(DS_TOKENS_CONSUMED.values()):,}/{TARGET_TOKENS[split]:,}")
