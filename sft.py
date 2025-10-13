@@ -11,7 +11,7 @@ from datetime import datetime
 device = util.get_device()
 autocast_dtype = util.get_autocast_dtype(device)
 logger.info(f"[sft] dtype: {autocast_dtype}")
-training_cfg = config.TrainingConfig(device=device)
+training_cfg = config.TrainingConfig(device=device, max_lr=5e-5, min_lr=5e-6)
 
 if device == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -20,8 +20,8 @@ if device == "cuda":
 
 
 def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfig):
-    train_ds = SFTShardedDataset(shards_dir=train_dir)
-    test_ds = SFTShardedDataset(shards_dir=test_dir)
+    train_ds = SFTShardedDataset(shards_dir=train_dir, config=training_cfg)
+    test_ds = SFTShardedDataset(shards_dir=test_dir, config=training_cfg)
 
     train_dl = DataLoader(train_ds, batch_size=training_cfg.batch_size, shuffle=True)
     test_dl = DataLoader(test_ds, batch_size=training_cfg.batch_size)
@@ -30,9 +30,9 @@ def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfi
 
 # setup tokenizer and dataloaders
 tokenizer = tiktoken.get_encoding("gpt2")
-train_dl, test_dl = get_dataloaders(Path("sft_data/shards/train"), Path("sft_data/shards/val"), training_cfg)
+train_dl, test_dl = get_dataloaders(Path("sft_data/train"), Path("sft_data/val"), training_cfg)
 # setup model and optimizer
-model = load_model_from_hf(repo_id="SkAndMl/moonlight-moe-pretrain", filename="pretrain.pt", device=device)
+model = load_model_from_hf(repo_id="SkAndMl/moonlight-moe-pretrain", filename="best.pt", device=device)
 model.train()
 logger.info(f"loaded pretrained checkpoint from HF")
 non_decay_names = ["norm", "bias"]
@@ -93,7 +93,7 @@ def save_ckpt(tag: str):
     )
     logger.info(f"ckpt saved to {ckpt_path}")
 
-prompt_mask = torch.vstack([torch.arange(0, 512) for _ in range(training_cfg.batch_size)]).to(device)
+prompt_mask = torch.vstack([torch.arange(0, training_cfg.ctx_size) for _ in range(training_cfg.batch_size)]).to(device)
 
 @torch.inference_mode()
 def eval():
@@ -108,7 +108,7 @@ def eval():
         # some more shape asserts
         assert prompt_lens.shape == content_lens.shape == (bsz, 1)
         # prepare mask
-        mask = (prompt_mask[:bsz, :] < prompt_lens - 1) | (prompt_mask[:bsz, :] >= content_lens - 1)
+        mask = (prompt_mask[:bsz, :] < prompt_lens) | (prompt_mask[:bsz, :] >= (content_lens - 2))
         y_masked = torch.where(mask, -100, y)
         # mixed precision training
         if autocast_dtype is not None:
@@ -134,61 +134,103 @@ def eval():
 
 
 @torch.inference_mode()
-def generate_samples():
+def generate_samples(step):
+    """Generate samples matching the types of data in SFT training"""
     model.eval()
-    test_prompts = {
-        "generate_long": {
-            "user_content": "Features: Lily, garden, butterfly\nWords: colorful, flying, happy",
-            "task": "generate_long"
+    
+    SYSTEM_ID = 50257
+    USER_ID = 50258
+    ASSISTANT_ID = 50259
+    
+    system_prompt = "You are a creative storyteller who writes engaging stories."
+    
+    # Test prompts matching your training data distribution
+    test_prompts = [
+        # WritingPrompts style (50% of training data)
+        {
+            "name": "WritingPrompts - Fantasy",
+            "user_prompt": "You discover a door in your basement that wasn't there yesterday. When you open it, you find yourself in a magical library where books write themselves."
         },
-        "generate_creative": {
-            "user_content": "You wake up one day to find that you can hear what animals are thinking.",
-            "task": "generate_creative"
+        {
+            "name": "WritingPrompts - Sci-Fi",
+            "user_prompt": "In the future, humans can download skills directly into their brains. You just downloaded the wrong skill by mistake."
         },
-        "generate_short": {
-            "user_content": "The Lost Treasure",
-            "task": "generate_short"
+        # TinyStories style (30% of training data) - Simple, child-friendly
+        {
+            "name": "TinyStories - Simple",
+            "user_prompt": "Write a short story."
         },
-        "summarize": {
-            "user_content": "Story: Once upon a time, there was a little girl named Lucy. She loved to play in the park with her friends. One day, she found a beautiful red ball under a big tree. Lucy was so happy! She played with the ball all day long. When it was time to go home, Lucy took the ball with her and showed it to her mom. Her mom smiled and said it was a very special ball.",
-            "task": "summarize"
+        {
+            "name": "TinyStories - Characters",
+            "user_prompt": "Tell me a story about a cat and a dog who become friends."
         },
-        "inference": {
-            "user_content": {
-                "paragraph": "Tom was very excited. Today was his birthday and all his friends were coming to his party.",
-                "option_1": "Tom felt sad and went to his room.",
-                "option_2": "Tom smiled and helped his mom decorate the house."
-            },
-            "task": "inference"
+        # ROCStories style (20% of training data) - Very short, 5 sentences
+        {
+            "name": "ROCStories - Short Narrative",
+            "user_prompt": "Create a short narrative."
+        },
+        # Mixed styles
+        {
+            "name": "Creative Adventure",
+            "user_prompt": "Write a creative story about adventure."
         }
-    }
+    ]
     
     logger.info("\n" + "="*70)
-    logger.info("GENERATION SAMPLES")
+    logger.info(f"GENERATION SAMPLES - Step {step + 1}")
     logger.info("="*70)
     
-    for task_name, prompt_data in test_prompts.items():
-        user_content = prompt_data["user_content"]
-        task = prompt_data["task"]
+    generations_html = []
+    
+    for prompt_data in test_prompts:
+        prompt_name = prompt_data["name"]
+        user_prompt = prompt_data["user_prompt"]
         
-        user_content_formatted = prompts.format_user_content(task, user_content)
-        x_part, _ = util.get_x_y_for_sft(prompts.SYSTEM_PROMPT, user_content_formatted, "")
+        # Build input tokens
+        system_tokens = [SYSTEM_ID] + tokenizer.encode(system_prompt)
+        user_tokens = [USER_ID] + tokenizer.encode(user_prompt)
+        assistant_start = [ASSISTANT_ID]
         
-        input_ids = torch.tensor(tokenizer.encode(x_part), device=device)
-        generated_ids = model.generate(input_ids)
-        generated_text = tokenizer.decode(generated_ids)
+        input_tokens = system_tokens + user_tokens + assistant_start
+        input_ids = torch.tensor(input_tokens, dtype=torch.long, device=device)
         
-        logger.info(f"\nTask: {task_name}")
-        if isinstance(user_content, dict):
-            logger.info(f"Prompt: {user_content['paragraph']}")
-        else:
-            logger.info(f"Prompt: {user_content[:100]}...") 
-        logger.info(f"Generated: {generated_text}")
-        logger.info("-" * 70)
+        try:
+            generated_tokens = model.generate(
+                input_ids,
+                max_tokens=300,
+                temperature=0.7,
+                top_p=0.9
+            )
+            generated_text = tokenizer.decode(generated_tokens)
+        except Exception as e:
+            generated_text = f"[Generation failed: {e}]"
+        
+        # Log to console
+        logger.info(f"\n{'-'*70}")
+        logger.info(f"Task: {prompt_name}")
+        logger.info(f"Prompt: {user_prompt}")
+        logger.info(f"\nGenerated:")
+        logger.info(generated_text)
+        logger.info("-"*70)
+        
+        # Collect for wandb (single log)
+        generations_html.append(
+            f"<div style='margin-bottom: 20px; padding: 10px; border: 1px solid #ddd;'>"
+            f"<h3 style='color: #333;'>{prompt_name}</h3>"
+            f"<p><strong>Prompt:</strong> {user_prompt}</p>"
+            f"<p><strong>Generated:</strong></p>"
+            f"<p style='white-space: pre-wrap;'>{generated_text}</p>"
+            f"</div>"
+        )
+    
+    # Log all generations to wandb at once
+    wandb.log({
+        "generations": wandb.Html("".join(generations_html)),
+        "step": step + 1
+    })
     
     logger.info("="*70 + "\n")
     model.train()
-
 
 logger.info("training...")
 train_dl = iter(train_dl)
@@ -209,7 +251,7 @@ for step in range(total_steps):
         # pos < prompt_len - 1 (system/user prompt)
         # pos >= content_len - 1 (padding tokens)
         # keeps only positions where we are predicting the assistant response
-        mask = (prompt_mask[:bsz, :] < prompt_lens - 1) | (prompt_mask[:bsz, :] >= content_lens - 1)
+        mask = (prompt_mask[:bsz, :] < prompt_lens) | (prompt_mask[:bsz, :] >= (content_lens - 2))
         y_masked = torch.where(mask, -100, y)
         # mixed precision training
         if autocast_dtype is not None:
@@ -265,13 +307,13 @@ for step in range(total_steps):
             "test/loss": val_loss
         })
 
-        generate_samples()
+        generate_samples(step)
         if val_loss < best_test:
             best_test = val_loss
             save_ckpt("sft_best")
             logger.info(f"✅ new best @ step {step+1}: {best_test:.4f}")
     
     if (step + 1) % 1000 == 0 or step == total_steps - 1:
-        save_ckpt("sft")  # Periodic checkpoint for recover
+        save_ckpt("sft")
 
 upload_to_hf(pathlib.Path("checkpoints/sft/sft_best.pt"), "SkAndMl/moonlight-moe-it")

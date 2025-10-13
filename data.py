@@ -27,8 +27,9 @@ class ShardedDataset(Dataset):
 
 class SFTShardedDataset(Dataset):
     
-    def __init__(self, shards_dir: Path) -> None:
+    def __init__(self, shards_dir: Path, config: TrainingConfig) -> None:
         self.shards_dir = Path(shards_dir)
+        self.cfg = config
         
         if not self.shards_dir.exists():
             raise ValueError(f"Shards directory does not exist: {self.shards_dir}")
@@ -44,11 +45,8 @@ class SFTShardedDataset(Dataset):
         for shard_path in self.shard_paths:
             memmap = np.memmap(shard_path, dtype=np.uint16, mode='r')
             
-            num_rows = len(memmap) // 515
-            if len(memmap) % 515 != 0:
-                print(f"Warning: {shard_path.name} size is not a multiple of 515, truncating")
-            
-            shaped = memmap[:num_rows * 515].reshape(-1, 515)
+            num_rows = len(memmap) // (self.cfg.ctx_size + 3)
+            shaped = memmap[:num_rows * (self.cfg.ctx_size + 3)].reshape(-1, self.cfg.ctx_size + 3)
             self.memmaps.append(shaped)
         
         shard_sizes = [len(memmap) for memmap in self.memmaps]
@@ -69,8 +67,8 @@ class SFTShardedDataset(Dataset):
         
         row = self.memmaps[shard_idx][local_idx]
         
-        tokens = torch.from_numpy(row[:513].copy()).long()
-        prompt_len = int(row[513])
-        content_len = int(row[514])
+        tokens = torch.from_numpy(row[:self.cfg.ctx_size + 1].copy()).long()
+        prompt_len = int(row[self.cfg.ctx_size + 1])
+        content_len = int(row[self.cfg.ctx_size + 2])
         
         return tokens, prompt_len, content_len
