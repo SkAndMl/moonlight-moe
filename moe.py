@@ -282,3 +282,40 @@ class GPTMoE(nn.Module):
                 break
         
         return x[0].tolist()[input_len:]
+    
+    def generate_stream(self, 
+                    x: Tensor, 
+                    max_tokens: int=20, 
+                    temperature: float=0.7, 
+                    top_p: float=0.9,
+                    repetition_penalty: float=1.15,
+                    repetition_penalty_length: int=10,
+                    stop_token_id: int = 50256):
+
+        assert x.ndim == 1
+        x = x.view(1, x.shape[0])
+        for _ in range(max_tokens):
+            logits = self(x)
+            # apply repetition_penalty
+            recent_tokens = x[:, -repetition_penalty_length:].flatten()
+            freqs = torch.bincount(recent_tokens, minlength=self.cfg.vocab_size)
+            logits[:, -1, :] = logits[:, -1, :] / torch.pow(torch.tensor(repetition_penalty, device=x.device), freqs)
+            # apply temperature
+            next_token_probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
+            # top-p sampling
+            sorted_probs, sorted_token_idxs = next_token_probs.sort(dim=-1, descending=True)
+            cap_idx = (torch.cumsum(sorted_probs, dim=-1) > top_p).nonzero()
+            cap_idx = cap_idx[0, 1].item() + 1 if cap_idx.numel() > 0 else next_token_probs.shape[-1]
+            top_p_probs = sorted_probs[:, :cap_idx]
+            # renormalize
+            top_p_probs /= top_p_probs.sum(dim=-1, keepdim=True)
+            # sample
+            sampled_idx = torch.multinomial(top_p_probs, num_samples=1)
+            next_token = sorted_token_idxs.gather(1, sampled_idx)
+            # yield the token
+            token_id = next_token[0, 0].item()
+            yield token_id
+            # append to sequence
+            x = torch.cat([x, next_token], dim=1)
+            if token_id == stop_token_id:
+                break

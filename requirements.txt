@@ -4,3 +4,5 @@ datasets==4.1.0
 tiktoken==0.11.0
 wandb==0.22.0
 python-dotenv==1.1.1
+uvicorn==0.37.0
+fastapi==0.119.0
