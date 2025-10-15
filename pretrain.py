@@ -1,12 +1,12 @@
 from config import TrainingConfig, ModelConfig
 from moe import GPTMoE
 from pathlib import Path
-from torch.optim import AdamW
 from datetime import datetime
 from log import logger
 from torch.utils.data import DataLoader
 from data import ShardedDataset
 from hf_utils import upload_to_hf
+from adamw import AdamW
 
 import torch, tiktoken, time, math, wandb, util, json
 
