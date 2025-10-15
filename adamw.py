@@ -34,7 +34,7 @@ class AdamW(Optimizer):
                 m, v = state["m"], state["v"]
                 t = state["step"] + 1
                 # calculate ema
-                m.mul_(beta_1).add_(g32, alpha=1-beta_1)
+                m.mul_(beta_1).add_(g32, alpha=1-beta_1) # this updates m in-place and stores in self.state
                 v.mul_(beta_2).addcmul_(g32, g32, value=1-beta_2)
                 # calculate unbiased values
                 m_hat = m / (1 - beta_1 ** t)

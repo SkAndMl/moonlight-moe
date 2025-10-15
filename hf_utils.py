@@ -1,4 +1,5 @@
 from huggingface_hub import HfApi, hf_hub_download, create_repo
+from datasets import load_dataset
 from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 from config import ModelConfig
@@ -6,6 +7,12 @@ from moe import GPTMoE
 import torch, os
 
 load_dotenv(find_dotenv())
+
+def stream_hf_dataset(hf_id: str, name: str, split: str):
+    ds = load_dataset(hf_id, name=name, split=split, streaming=True, token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
+    while True: # makes the data infinite, by repeatedly iterating
+        for row in ds:
+            yield row
 
 def upload_to_hf(checkpoint_path: Path, repo_id: str, commit_message: str = "Upload checkpoint"):
     token = os.environ.get("HUGGINGFACE_HUB_TOKEN")
