@@ -19,7 +19,7 @@ def get_device() -> Literal["cuda", "mps", "cpu"]:
     return "cpu"
 
 def get_autocast_dtype(device: str):
-    if device == "cuda" and torch.cuda.is_bf16_supported():
+    if device.startswith("cuda") and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return None
 

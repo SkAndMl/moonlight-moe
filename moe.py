@@ -35,7 +35,7 @@ def apply_rot_emb(x: Tensor, freq_cis: Tensor) -> Tensor:
     _x_rot = _x * freqs.to(_x.dtype) # bsz, n_heads, seq_len, head_dim / 2
     _x_rot = torch.view_as_real(_x_rot) # bsz, n_heads, seq_len, head_dim / 2, 2
     _x_rot = _x_rot.view(bsz, n_heads, seq_len, head_dim)
-    return _x_rot
+    return _x_rot.to(x.dtype)
 
 
 class RMSNorm(nn.Module):
