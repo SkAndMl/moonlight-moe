@@ -6,9 +6,10 @@ from log import logger
 from torch.utils.data import DataLoader
 from data import ShardedDataset
 from hf_utils import upload_to_hf
-from adamw import AdamW
+# from adamw import AdamW
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.optim import AdamW
 
 import torch, tiktoken, time, math, wandb, util, json, os
 import torch.distributed as dist
@@ -65,7 +66,7 @@ def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfi
         batch_size=training_cfg.batch_size, 
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
         drop_last=True,
         prefetch_factor=4,
@@ -75,7 +76,7 @@ def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfi
         test_ds, 
         batch_size=training_cfg.batch_size,
         sampler=test_sampler,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
         drop_last=True
     )
@@ -85,8 +86,6 @@ def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfi
 tokenizer = tiktoken.get_encoding("gpt2")
 training_cfg, model_cfg = TrainingConfig(device=device), ModelConfig()
 
-if is_distributed:
-    training_cfg.batch_size = training_cfg.batch_size // world_size
 
 train_dl, test_dl, train_sampler, test_sampler = get_dataloaders(
     Path("pretrain_data/train"), 
@@ -151,7 +150,6 @@ def evaluate() -> torch.Tensor:
         loss_accum = loss_tensor
         num_batches = int(batch_tensor.item())
 
-
     model.train()
     return loss_accum / num_batches
 
@@ -166,7 +164,9 @@ if is_distributed:
         model,
         device_ids=[local_rank],
         output_device=local_rank,
-        gradient_as_bucket_view=True
+        gradient_as_bucket_view=True,
+        find_unused_parameters=True,         
+        static_graph=False
     )
     if is_main_process():
         logger.info(f"wrapped model with DDP...")
@@ -181,12 +181,16 @@ optimizer = AdamW(
     params=[
         {"params": param_groups["decay_params"], "weight_decay": training_cfg.weight_decay},
         {"params": param_groups["non_decay_params"], "weight_decay": 0}
-    ]
+    ],
+    lr=training_cfg.max_lr,
+    betas=(0.9, 0.95),
+    eps=1e-8,
+    fused=True
 )
 
 CKPT_DIR = Path("checkpoints/pretrain")
 if is_main_process():
-    CKPT_DIR.mkdir(exist_ok=True)
+    CKPT_DIR.mkdir(exist_ok=True, parents=True)
 
 best_test = float("inf")
 
@@ -228,7 +232,7 @@ for step in range(total_steps):
             train_dl_iter = iter(train_dl)
             x, y = next(train_dl_iter)
 
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         bsz, seq_len = x.shape
         if autocast_dtype is not None:
             with torch.autocast(device_type="cuda", dtype=autocast_dtype):
@@ -325,7 +329,7 @@ for step in range(total_steps):
                     "step": step + 1
                 })
 
-    if (step + 1) % 200 == 0 or step == total_steps - 1:
+    if (step + 1) % 1000 == 0 or step == total_steps - 1:
         test_loss = evaluate()
         val = float(test_loss.item())
 
@@ -342,7 +346,7 @@ for step in range(total_steps):
                 save_ckpt("best", step + 1, best_test)
                 logger.info(f"✅ new best @ step {step+1}: {best_test:.4f}")
 
-    if (step + 1) % 200 == 0 and is_main_process():
+    if (step + 1) % 500 == 0 and is_main_process():
         raw_model.eval()
         start = "There was a"
         with torch.no_grad():
