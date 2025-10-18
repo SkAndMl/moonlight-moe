@@ -11,7 +11,7 @@ from datetime import datetime
 device = util.get_device()
 autocast_dtype = util.get_autocast_dtype(device)
 logger.info(f"[it] dtype: {autocast_dtype}")
-training_cfg = config.TrainingConfig(device=device, max_lr=5e-5, min_lr=5e-6)
+training_cfg = config.TrainingConfig(device=device, max_lr=2e-4, min_lr=1e-4)
 
 if device == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -229,7 +229,7 @@ for step in range(total_steps):
         "step": step + 1
     })
 
-    if (step + 1) % 50 == 0 or step == total_steps - 1:
+    if (step + 1) % 500 == 0 or step == total_steps - 1:
         val_loss = eval()
         logger.info(f"step: {step + 1:>5} | val_loss: {val_loss:.4f}")
         wandb.log({
@@ -242,7 +242,7 @@ for step in range(total_steps):
             save_ckpt("it_best")
             logger.info(f"✅ new best @ step {step+1}: {best_test:.4f}")
     
-    if (step + 1) % 50 == 0 or step == total_steps - 1:
+    if (step + 1) % 500 == 0 or step == total_steps - 1:
         save_ckpt("it")
 
 upload_to_hf(pathlib.Path("checkpoints/it/it_best.pt"), "SkAndMl/moonlight-moe-it")

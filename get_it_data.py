@@ -17,8 +17,8 @@ HF_ID = "HuggingFaceTB/smoltalk"
 SPLIT_SALT = "moonlight"
 
 IT_TARGET_TOKENS = {
-    "train": 20_000_000,
-    "test": int(20_000_000 * 0.05)
+    "train": 100_000_000,
+    "test": int(100_000_000 * 0.05)
 }
 
 IT_SPLIT_THRESHOLDS = {
@@ -28,10 +28,11 @@ IT_SPLIT_THRESHOLDS = {
 
 IT_SUBSET_SPLIT = {
     "smol-summarize": 0.05,
-    "smol-constraints": 0.05,
+    "explore-instruct-rewriting": 0.05,
+    "smol-constraints": 0.1,
     "self-oss-instruct": 0.3,
     "metamathqa-50k": 0.3,
-    "openhermes-100k": 0.3
+    "openhermes-100k": 0.2
 }
 
 
@@ -59,7 +60,7 @@ def assign_split(doc_key: str) -> Literal["train", "test"]:
     return "train" if u < IT_SPLIT_THRESHOLDS["train"] else "test"
 
 
-def format(messages: list[dict], subset_name=None) -> list[int]:
+def format(messages: list[dict]) -> list[int]:
     if len(messages) not in {2, 3}:
         return None
     system_content, user_content, assistant_content = "", "", ""
@@ -72,28 +73,14 @@ def format(messages: list[dict], subset_name=None) -> list[int]:
             case "assistant":
                 assistant_content += row["content"].strip()
 
-    SYS_DEFAULT = (
-        "Be correct and concise. Prefer bullet points. "
-        "Say \"I don't know\" if unsure. Follow instructions precisely."
+    SYS_UNIVERSAL = (
+        "You are a helpful, accurate, and concise AI assistant. "
+        "Follow instructions precisely. "
+        "If you're unsure, say so."
     )
-    SYS_BY_SUBSET = {
-        "smol-constraints": (
-            "Be correct and concise. When a JSON schema is implied, output ONLY the JSON—no extra text."
-        ),
-        "smol-summarize": (
-            "Summarize briefly. Aim for 3–5 bullet points or 1–3 sentences. No repetition."
-        ),
-        "metamathqa-50k": (
-            "Solve briefly. If steps are needed, keep them ≤3. Return ONLY the final answer."
-        ),
-        "self-oss-instruct": (
-            "Follow the instruction precisely. If code is requested, provide a minimal, runnable snippet with no extra commentary."
-        ),
-        "openhermes-100k": SYS_DEFAULT,
-    }
 
     if len(system_content) == 0:
-        system_content += SYS_BY_SUBSET.get(subset_name or "", SYS_DEFAULT)
+        system_content += SYS_UNIVERSAL
 
     x = (
         [SYSTEM_TOKEN_ID] + 
@@ -127,7 +114,7 @@ while True:
     if it_tokens_consumed[split][subset] >= int(IT_SUBSET_SPLIT[subset] * IT_TARGET_TOKENS[split]):
         continue
 
-    formatted_content = format(row["messages"], subset)
+    formatted_content = format(row["messages"])
     if formatted_content is None:
         continue
 
