@@ -150,7 +150,6 @@ Scripts (summaries):
 
 * **FineWeb-Edu** for pretraining data.
 * Open instruction dataset: **SmolTalk**
-* 
 ---
 
 ## Citation
