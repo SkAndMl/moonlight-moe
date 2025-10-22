@@ -142,14 +142,14 @@ def eval():
         # mixed precision training
         if autocast_dtype is not None:
             with torch.amp.autocast(device, autocast_dtype):
-                logits: torch.Tensor = model(x)
+                logits, _ = model(x)
                 loss = F.cross_entropy(
                     logits.view(bsz*seq_len, -1),
                     y_masked.view(-1,),
                     ignore_index=-100
                 )
         else:
-            logits: torch.Tensor = model(x)
+            logits, _ = model(x)
             loss = F.cross_entropy(
                 logits.view(bsz*seq_len, -1),
                 y_masked.view(-1,),
@@ -185,14 +185,14 @@ for step in range(total_steps):
         # mixed precision training
         if autocast_dtype is not None:
             with torch.amp.autocast(device, autocast_dtype):
-                logits: torch.Tensor = model(x)
+                logits, _ = model(x)
                 ce_loss = F.cross_entropy(
                     logits.view(bsz * seq_len, -1),
                     y_masked.view(-1,),
                     ignore_index=-100
                 )
         else:
-            logits: torch.Tensor = model(x)
+            logits, _ = model(x)
             ce_loss = F.cross_entropy(
                 logits.view(bsz * seq_len, -1),
                 y_masked.view(-1,),

@@ -3,6 +3,7 @@ import torch, math
 from config import ModelConfig
 from torch import nn, Tensor
 from torch.nn import functional as F
+from typing import Optional, Tuple, List
 
 def fan_in(module: nn.Module) -> int | None:
     w = getattr(module, "weight", None)
@@ -26,12 +27,12 @@ def get_freqs_cis(cfg: ModelConfig) -> Tensor:
 
     return torch.complex(_real, _img)
 
-def apply_rot_emb(x: Tensor, freq_cis: Tensor) -> Tensor:
+def apply_rot_emb(x: Tensor, freq_cis: Tensor, start_pos: int=0) -> Tensor:
     # x -> bsz, n_heads, seq_len, head_dim
     bsz, n_heads, seq_len, head_dim = x.shape
     _x = x.view(bsz, n_heads, seq_len, head_dim // 2, 2)
     _x = torch.view_as_complex(_x.to(torch.float32)) # bsz, n_heads, seq_len, head_dim / 2
-    freqs = freq_cis[..., :seq_len, :]
+    freqs = freq_cis[..., start_pos: start_pos + seq_len, :]
     _x_rot = _x * freqs.to(_x.dtype) # bsz, n_heads, seq_len, head_dim / 2
     _x_rot = torch.view_as_real(_x_rot) # bsz, n_heads, seq_len, head_dim / 2, 2
     _x_rot = _x_rot.view(bsz, n_heads, seq_len, head_dim)
@@ -69,26 +70,34 @@ class MHA(nn.Module):
         self.register_buffer("mask", mask)
 
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, past_kv: Optional[Tuple[torch.Tensor]]=None):
         bsz, seq_len, embed_dim = x.shape
         n_heads, head_dim = self.cfg.n_heads, embed_dim // self.cfg.n_heads
-        qkv = self.QKV(x) #
+        qkv = self.QKV(x)
         q, k, v = qkv.split(embed_dim, -1)
         q: Tensor = q.view(bsz, seq_len, n_heads, head_dim).transpose(1, 2) # bsz, n_heads, seq_len, head_dim
         k: Tensor = k.view(bsz, seq_len, n_heads, head_dim).transpose(1, 2)
         v: Tensor = v.view(bsz, seq_len, n_heads, head_dim).transpose(1, 2)
 
-        q, k = apply_rot_emb(q, self.freqs_cis), apply_rot_emb(k, self.freqs_cis)
+        start_pos = 0
+        if past_kv is not None:
+            start_pos = past_kv[0].shape[2]
+
+        q, k = apply_rot_emb(q, self.freqs_cis, start_pos), apply_rot_emb(k, self.freqs_cis, start_pos)
+
+        if past_kv is not None:
+            _k, _v = past_kv
+            k, v = torch.cat((_k, k), dim=2), torch.cat((_v, v), dim=2)
 
         # wts = (q @ k.transpose(-2, -1)) / math.sqrt(head_dim)
         # wts = wts + self.mask[:, :, :seq_len, :seq_len]
         # wts = F.softmax(wts, dim = -1)
         # y = wts @ v # bsz, n_heads, seq_len, head_dim 
         # use flash attention instead
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=past_kv is None)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, embed_dim)
-        return self.O(y)
+        return self.O(y), (k, v)
 
 
 class Router(nn.Module):
@@ -175,11 +184,12 @@ class Block(nn.Module):
         self.norm1 = RMSNorm(cfg)
         self.norm2 = RMSNorm(cfg)
 
-    def forward(self, x: Tensor) -> Tensor:
-
-        x = x + self.mha(self.norm1(x))
+    def forward(self, x: Tensor, past_kv: Optional[Tuple[torch.Tensor]]=None):
+        
+        attn_out, new_kv = self.mha(self.norm1(x), past_kv)
+        x = x + attn_out
         x = x + self.ffn(self.norm2(x))
-        return x
+        return x, new_kv
 
 class GPTMoE(nn.Module):
 
@@ -202,12 +212,15 @@ class GPTMoE(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, past_kvs: Optional[List[Tuple[torch.Tensor]]]=None):
+        new_kvs = []
         x = self.tok_emb(x)
-        for block in self.blocks:
-            x = block(x)
+        for i, block in enumerate(self.blocks):
+            past_kv = past_kvs[i] if past_kvs is not None else None
+            x, new_kv = block(x, past_kv)
+            new_kvs.append(new_kv)
 
-        return self.lm_head(self.norm(x))
+        return self.lm_head(self.norm(x)), new_kvs
 
     def moe_aux_loss(self) -> Tensor:
         _loss = torch.tensor(0.0, device=self.lm_head.weight.device)
@@ -258,8 +271,10 @@ class GPTMoE(nn.Module):
         assert x.ndim == 1
         input_len = x.shape[0]
         x = x.view(1, x.shape[0])
+        past_kvs = None
         for _ in range(max_tokens):
-            logits = self(x)
+            input_ids = x[:, -1:] if past_kvs is not None else x
+            logits, past_kvs = self(input_ids, past_kvs)
             # apply repetition_penalty
             recent_tokens = x[:, -repetition_penalty_length:].flatten()
             freqs = torch.bincount(recent_tokens, minlength=self.cfg.vocab_size)
@@ -294,8 +309,10 @@ class GPTMoE(nn.Module):
 
         assert x.ndim == 1
         x = x.view(1, x.shape[0])
+        past_kvs = None
         for _ in range(max_tokens):
-            logits = self(x)
+            input_ids = x[:, -1:] if past_kvs is not None else x
+            logits, past_kvs = self(input_ids, past_kvs)
             # apply repetition_penalty
             recent_tokens = x[:, -repetition_penalty_length:].flatten()
             freqs = torch.bincount(recent_tokens, minlength=self.cfg.vocab_size)

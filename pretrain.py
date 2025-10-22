@@ -131,10 +131,10 @@ def evaluate() -> torch.Tensor:
         bsz, seq_len = x.shape
         if autocast_dtype is not None:
             with torch.autocast("cuda", dtype=autocast_dtype):
-                logits: torch.Tensor = model(x)
+                logits, _ = model(x)
                 loss = torch.nn.functional.cross_entropy(logits.view(bsz*seq_len, -1), y.view(-1,))
         else:
-            logits: torch.Tensor = model(x)
+            logits, _ = model(x)
             loss = torch.nn.functional.cross_entropy(logits.view(bsz*seq_len, -1), y.view(-1,))
         
         loss_accum += loss.detach()
@@ -236,12 +236,12 @@ for step in range(total_steps):
         bsz, seq_len = x.shape
         if autocast_dtype is not None:
             with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-                logits: torch.Tensor = model(x)
+                logits, _ = model(x)
                 ce = torch.nn.functional.cross_entropy(
                     logits.view(bsz * seq_len, -1), y.view(-1,)
                 )
         else:
-            logits: torch.Tensor = model(x)
+            logits, _ = model(x)
             ce = torch.nn.functional.cross_entropy(
                 logits.view(bsz * seq_len, -1), y.view(-1,)
             ) 
