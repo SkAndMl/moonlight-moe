@@ -1,17 +1,69 @@
-import pathlib, tiktoken, config, util, torch, math, time, wandb, operator
-from data import ShardedDataset
-from torch.utils.data import DataLoader
-from hf_utils import load_model_from_hf, upload_to_hf
-from log import logger
+from torch.utils.data import Dataset, DataLoader
 from torch.nn import functional as F
-from config import TrainingConfig
-from pathlib import Path
+from datasets import load_dataset
+from typing import Literal
+from tiktoken import get_encoding
+from log import logger
+from hf_utils import load_model_from_hf, upload_to_hf
 from datetime import datetime
+
+import torch, util, config, operator, tiktoken, wandb, math, pathlib, time
+
+
+SYSTEM_PROMPT = """
+You are a math reasoning assistant.
+Solve the following problem. Think step by step, but put your reasoning inside <thought>...</thought>
+and the final result inside <answer>...</answer>.
+
+Problem: {question}
+"""
+
+class GSM8KDS(Dataset):
+
+    def __init__(self, split: Literal["train", "test"], ctx_size: int):
+        self.rows = self._get_valid_rows(split, ctx_size)
+    
+    def _format_gsm8k_answer(self, answer: str) -> tuple[str, str]:
+        thought, final_answer = answer.split("####")
+        return thought.strip(), final_answer.strip()
+
+    def _get_valid_rows(self, split: Literal["train", "test"], ctx_size) -> list[int]:
+        ds = load_dataset("openai/gsm8k", "main")[split]
+        rows = []
+        for row in ds:
+            question, answer = row["question"], row["answer"]
+            thought, final_answer = self._format_gsm8k_answer(answer)
+
+            system_prompt = SYSTEM_PROMPT.format(question=question)
+            assistant_content = f"<thought>{thought}</thought><answer>{final_answer}</answer>"
+
+            tokens = [config.SYSTEM_TOKEN_ID] + \
+                    tokenizer.encode(system_prompt) + \
+                    [config.ASSISTANT_TOKEN_ID] + \
+                    tokenizer.encode(assistant_content) + \
+                    [EOT_TOKEN_ID]
+            
+            if len(tokens) < ctx_size + 1:
+                tokens += [EOT_TOKEN_ID] * (ctx_size + 1 - len(tokens))
+            
+            if len(tokens) > ctx_size + 1:
+                continue
+            rows.append(tokens)
+        return rows
+
+    def __len__(self) -> int:
+        return len(self.rows)
+    
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        assert idx < len(self.rows)
+        row = self.rows[idx]
+        return torch.tensor(row[:-1]).long(), torch.tensor(row[1:]).long()
+
 
 device = util.get_device()
 autocast_dtype = util.get_autocast_dtype(device)
-logger.info(f"[it] dtype: {autocast_dtype}")
-training_cfg = config.TrainingConfig(device=device, max_lr=2e-4, min_lr=1e-4)
+logger.info(f"[math-sft] dtype: {autocast_dtype}")
+training_cfg = config.TrainingConfig(device=device, max_lr=1e-4, min_lr=2e-5)
 
 if device == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -19,9 +71,9 @@ if device == "cuda":
     torch.set_float32_matmul_precision("high")
 
 
-def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfig):
-    train_ds = ShardedDataset(shards_dir=train_dir, config=training_cfg)
-    test_ds = ShardedDataset(shards_dir=test_dir, config=training_cfg)
+def get_dataloaders(training_cfg: config.TrainingConfig):
+    train_ds = GSM8KDS(split="train", ctx_size=training_cfg.ctx_size)
+    test_ds = GSM8KDS(split="test", ctx_size=training_cfg.ctx_size)
 
     train_dl = DataLoader(
         train_ds, 
@@ -46,13 +98,10 @@ def get_dataloaders(train_dir: Path, test_dir: Path, training_cfg: TrainingConfi
 # setup tokenizer and special tokens
 tokenizer = tiktoken.get_encoding("gpt2")
 EOT_TOKEN_ID = tokenizer.eot_token
-SYSTEM_TOKEN_ID = 50257
-USER_TOKEN_ID = 50258
-ASSISTANT_TOKEN_ID = 50259
 # setup dataloaders
-train_dl, test_dl = get_dataloaders(Path("sft_data/it/train"), Path("sft_data/it/test"), training_cfg)
+train_dl, test_dl = get_dataloaders(training_cfg)
 # setup model and optimizer
-model = load_model_from_hf(repo_id="SkAndMl/moonlight-moe-pretrain", filename="best.pt", device=device)
+model = load_model_from_hf(repo_id="SkAndMl/moonlight-moe-it", filename="best.pt", device=device)
 model.train()
 logger.info(f"loaded pretrained checkpoint from HF")
 non_decay_names = ["norm", "bias"]
@@ -60,9 +109,9 @@ param_groups = {
     "non_decay": [p for name, p in model.named_parameters() if any(_ in name for _ in non_decay_names)],
     "decay": [p for name, p in model.named_parameters() if not any(_ in name for _ in non_decay_names)]
 }
-logger.info(f"[it] model params: {sum(p.numel() for p in model.parameters()):,}")
-logger.info(f"[it] decay params: {sum(p.numel() for p in param_groups['decay']):,}")
-logger.info(f"[it] non_decay params: {sum(p.numel() for p in param_groups['non_decay']):,}")
+logger.info(f"[math-sft] model params: {sum(p.numel() for p in model.parameters()):,}")
+logger.info(f"[math-sft] decay params: {sum(p.numel() for p in param_groups['decay']):,}")
+logger.info(f"[math-sft] non_decay params: {sum(p.numel() for p in param_groups['non_decay']):,}")
 
 optimizer = torch.optim.AdamW(
     params=[
@@ -75,12 +124,13 @@ optimizer = torch.optim.AdamW(
     fused=device.startswith("cuda")
 )
 
-total_steps = len(train_dl) // training_cfg.accumulation_steps
+n_epochs = 5
+total_steps = n_epochs * len(train_dl) // training_cfg.accumulation_steps
 warmup_steps = int(0.10 * total_steps)
-logger.info(f"[it] total_steps: {total_steps} | warmup_steps: {warmup_steps}")
+logger.info(f"[math-sft] total_steps: {total_steps} | warmup_steps: {warmup_steps}")
 
 wandb.init(
-    project=f"gpt-moe-it-{datetime.now().strftime('%d_%m_%Y')}",
+    project=f"gpt-moe-math-sft-{datetime.now().strftime('%d_%m_%Y')}",
     config={
         "model_cfg": model.cfg.model_dump(),
         "training_cfg": training_cfg.model_dump(),
@@ -100,7 +150,7 @@ def get_lr(it: int):
         return min_lr
     
 
-CKPT_DIR = pathlib.Path("checkpoints/it")
+CKPT_DIR = pathlib.Path("checkpoints/grpo")
 CKPT_DIR.mkdir(exist_ok=True, parents=True)
 def save_ckpt(tag: str):
     ckpt_path = CKPT_DIR / f"{tag}.pt"
@@ -124,7 +174,7 @@ def construct_mask(y: torch.Tensor) -> torch.Tensor:
         mask = op(prompt_mask[:y.shape[0], :], indices)
         return mask
 
-    content_mask = _construct_mask(ASSISTANT_TOKEN_ID, operator.le)
+    content_mask = _construct_mask(config.ASSISTANT_TOKEN_ID, operator.le)
     eot_mask = _construct_mask(EOT_TOKEN_ID, operator.gt)
     return content_mask | eot_mask
 
@@ -218,7 +268,7 @@ for step in range(total_steps):
         param_group["lr"] = lr    
     optimizer.step()
 
-    logger.info(f"[it] step: {step + 1:>5} | loss: {loss_accum:.4f} | lr: {lr:2e} | norm: {norm.item():.4f} | token throughput: {token_throughput:.4f}")
+    logger.info(f"[math-sft] step: {step + 1:>5} | loss: {loss_accum:.4f} | lr: {lr:2e} | norm: {norm.item():.4f} | token throughput: {token_throughput:.4f}")
 
     wandb.log({
         "train/loss": loss_accum,
@@ -238,10 +288,10 @@ for step in range(total_steps):
         # generate_samples(step)
         if val_loss < best_test:
             best_test = val_loss
-            save_ckpt("it_best")
-            logger.info(f"✅ new best @ step {step+1}: {best_test:.4f}")
+            save_ckpt("math_sft_best")
+            logger.info(f"new best @ step {step+1}: {best_test:.4f}")
     
     if (step + 1) % 500 == 0 or step == total_steps - 1:
-        save_ckpt("it")
+        save_ckpt("math_sft")
 
-upload_to_hf(pathlib.Path("checkpoints/it/it_best.pt"), "SkAndMl/moonlight-moe-it")
+upload_to_hf(pathlib.Path("checkpoints/grpo/math_sft_best.pt"), "SkAndMl/moonlight-moe-math-sft")

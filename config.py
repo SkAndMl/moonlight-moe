@@ -1,6 +1,5 @@
 from pydantic import BaseModel
-from dataclasses import dataclass, field
-from typing import Dict
+from tiktoken import get_encoding
 
 class ModelConfig(BaseModel):
     base: int = 10000
@@ -24,3 +23,11 @@ class TrainingConfig(BaseModel):
     weight_decay: float = 1e-2
     accumulation_steps: int = 8
     device: str = "cpu"
+
+
+tokenizer = get_encoding("gpt2")
+
+EOT_TOKEN_ID = tokenizer.eot_token
+SYSTEM_TOKEN_ID = 50257
+USER_TOKEN_ID = 50258
+ASSISTANT_TOKEN_ID = 50259
