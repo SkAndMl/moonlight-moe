@@ -1,13 +1,14 @@
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.nn import functional as F
 from datasets import load_dataset
 from typing import Literal
-from tiktoken import get_encoding
 from log import logger
 from hf_utils import load_model_from_hf, upload_to_hf
 from datetime import datetime
+from config import tokenizer
 
-import torch, util, config, operator, tiktoken, wandb, math, pathlib, time
+import torch, util, config, operator, wandb, math, pathlib, time
+import re, random
 
 
 SYSTEM_PROMPT = """
@@ -41,10 +42,10 @@ class GSM8KDS(Dataset):
                     tokenizer.encode(system_prompt) + \
                     [config.ASSISTANT_TOKEN_ID] + \
                     tokenizer.encode(assistant_content) + \
-                    [EOT_TOKEN_ID]
+                    [config.EOT_TOKEN_ID]
             
             if len(tokens) < ctx_size + 1:
-                tokens += [EOT_TOKEN_ID] * (ctx_size + 1 - len(tokens))
+                tokens += [config.EOT_TOKEN_ID] * (ctx_size + 1 - len(tokens))
             
             if len(tokens) > ctx_size + 1:
                 continue
@@ -60,6 +61,51 @@ class GSM8KDS(Dataset):
         return torch.tensor(row[:-1]).long(), torch.tensor(row[1:]).long()
 
 
+class MetaMathQA(Dataset):
+
+    def __init__(self, ctx_size: int, num_samples: int):
+        self.rows = self._get_valid_rows(ctx_size=ctx_size, num_samples=num_samples)
+    
+    def _get_valid_rows(self, ctx_size: int, num_samples: int):
+        ds = load_dataset("meta-math/MetaMathQA")["train"]
+        assert num_samples <= ds.num_rows
+        random.seed(2406)
+        random_idxs = random.sample(range(ds.num_rows), k=num_samples)
+        rows = []
+        for random_idx in random_idxs:
+            row = ds[random_idx]
+            question, answer = row["original_question"], row["response"]
+
+            parts = answer.rsplit("The answer is: ", 1)
+            if len(parts) != 2 or re.fullmatch(r"\d+", parts[-1].strip()) is None:
+                continue
+            
+            thought, final_answer = parts
+            system_prompt = SYSTEM_PROMPT.format(question=question.strip())
+            assistant_content = f"<thought>{thought}</thought><answer>{final_answer}</answer>"
+
+            tokens = [config.SYSTEM_TOKEN_ID] + \
+                     tokenizer.encode(system_prompt) + \
+                     [config.ASSISTANT_TOKEN_ID] + \
+                     tokenizer.encode(assistant_content) + \
+                     [config.EOT_TOKEN_ID]
+            
+            if len(tokens) > ctx_size + 1:
+                continue
+            if len(tokens) < ctx_size + 1:
+                tokens += [config.EOT_TOKEN_ID] * (ctx_size + 1 - len(tokens))
+            
+            rows.append(tokens)
+        
+        return rows
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        row = self.rows[idx]
+        return torch.tensor(row[:-1]).long(), torch.tensor(row[1:]).long()
+
 device = util.get_device()
 autocast_dtype = util.get_autocast_dtype(device)
 logger.info(f"[math-sft] dtype: {autocast_dtype}")
@@ -72,11 +118,12 @@ if device == "cuda":
 
 
 def get_dataloaders(training_cfg: config.TrainingConfig):
-    train_ds = GSM8KDS(split="train", ctx_size=training_cfg.ctx_size)
+    train_ds_1 = GSM8KDS(split="train", ctx_size=training_cfg.ctx_size)
+    train_ds_2 = MetaMathQA(ctx_size=training_cfg.ctx_size, num_samples=20000)
     test_ds = GSM8KDS(split="test", ctx_size=training_cfg.ctx_size)
 
     train_dl = DataLoader(
-        train_ds, 
+        ConcatDataset([train_ds_1, train_ds_2]), 
         batch_size=training_cfg.batch_size, 
         shuffle=True,
         num_workers=8,
@@ -95,13 +142,10 @@ def get_dataloaders(training_cfg: config.TrainingConfig):
     return train_dl, test_dl
 
 
-# setup tokenizer and special tokens
-tokenizer = tiktoken.get_encoding("gpt2")
-EOT_TOKEN_ID = tokenizer.eot_token
 # setup dataloaders
 train_dl, test_dl = get_dataloaders(training_cfg)
 # setup model and optimizer
-model = load_model_from_hf(repo_id="SkAndMl/moonlight-moe-it", filename="best.pt", device=device)
+model = load_model_from_hf(repo_id="SkAndMl/moonlight-moe-it", filename="it_best.pt", device=device)
 model.train()
 logger.info(f"loaded pretrained checkpoint from HF")
 non_decay_names = ["norm", "bias"]
@@ -175,7 +219,7 @@ def construct_mask(y: torch.Tensor) -> torch.Tensor:
         return mask
 
     content_mask = _construct_mask(config.ASSISTANT_TOKEN_ID, operator.le)
-    eot_mask = _construct_mask(EOT_TOKEN_ID, operator.gt)
+    eot_mask = _construct_mask(config.EOT_TOKEN_ID, operator.gt)
     return content_mask | eot_mask
 
 @torch.inference_mode()
