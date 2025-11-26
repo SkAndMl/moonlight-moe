@@ -39,7 +39,7 @@ def upload_to_hf(checkpoint_path: Path, repo_id: str, commit_message: str = "Upl
     print(f"✅ Uploaded to https://huggingface.co/{repo_id}")
 
 
-def load_model_from_hf(repo_id: str, filename: str = "best.pt", device: str = "cuda"):
+def load_model_from_hf(repo_id: str, filename: str = "best.pt", device: str = "cuda") -> GPTMoE:
     checkpoint_path = hf_hub_download(
         repo_id=repo_id,
         filename=filename,
